@@ -42,7 +42,7 @@ from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
 from pipecat.workers.runner import WorkerRunner
 
-from lipsync.lipsync_processor import LipsyncProcessor
+from lipsync.lipsync_processor import LipsyncParams, LipsyncProcessor
 from lipsync.rtvi import LipsyncMessageRelay
 
 load_dotenv(override=True)
@@ -84,7 +84,12 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     # keyframes; the relay (placed after transport.output(), where the clock
     # queue releases them at pts) delivers each batch to clients as a stock
     # RTVI server-message with data.type "bot-tts-lipsync".
-    lipsync = LipsyncProcessor()
+    #
+    # The text tier reads the TTS's own word stream: it recognises written
+    # hums and keeps close vowels (/i u/) from reading as nasal murmurs, which
+    # otherwise shut the mouth on them. Without usable text the output is
+    # exactly the DSP-only output.
+    lipsync = LipsyncProcessor(params=LipsyncParams(text_events_enabled=True))
     lipsync_relay = LipsyncMessageRelay()
 
     context = LLMContext()
