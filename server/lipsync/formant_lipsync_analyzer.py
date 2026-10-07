@@ -132,6 +132,16 @@ _NASAL_F2_MAX_BANDWIDTH_HZ = 300.0
 # without this rule. Keep "always" until a cue that separates murmurs from
 # close vowels exists (plans/deep-review-2026-09-results.md).
 _NASAL_MISSING_F2_DAMPED = "always"
+# The same rule on hops covered by trusted text (the text tier on, and a
+# sentence it accepted; otherwise output stays exactly DSP-only). Its only
+# reason to exist is the voice whose hums have no other evidence, and with
+# text the hums come from the words instead (written "hmm", /m/ spans):
+# measured on the seven corpus
+# voices, hums latch on 74-98 % of their voiced hops with "never" here,
+# against 0-76 % with the text tier off, while close vowels stop reading as
+# murmurs — /i/ hops latched drop from up to 19 % to <= 1 % per voice, /u/
+# on the quickstart voice from 51 % to 33 %.
+_NASAL_MISSING_F2_DAMPED_WITH_TEXT = "never"
 _NASAL_DARK_RATIO = 0.9
 _NASAL_SPURIOUS_F2_HZ = 1200.0
 # A root at or below this above F1 (``FormantEstimate.f2_low``: any
@@ -705,9 +715,16 @@ class FormantLipsyncAnalyzer(BaseLipsyncAnalyzer):
             f2_present = f2_found or f2_broad > 0.0
             f3 = formants.f3 if f3_found else self._prev_f3
             dark = low_ratio > _NASAL_DARK_RATIO
+            # Only where trusted text covers this hop: without it the output
+            # must stay exactly the DSP-only output.
+            text_covers = (
+                self._text_events is not None and self._text_events.segment_at(offset) is not None
+            )
+            missing_f2_mode = (
+                _NASAL_MISSING_F2_DAMPED_WITH_TEXT if text_covers else _NASAL_MISSING_F2_DAMPED
+            )
             f2_missing_damped = not f2_found and (
-                _NASAL_MISSING_F2_DAMPED == "always"
-                or (_NASAL_MISSING_F2_DAMPED == "dark" and dark)
+                missing_f2_mode == "always" or (missing_f2_mode == "dark" and dark)
             )
             vowel_f2 = 0.0 < formants.f2_low <= _NASAL_VOWEL_F2_MAX_HZ
             f2_damped = not vowel_f2 and (

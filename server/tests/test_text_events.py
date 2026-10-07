@@ -183,6 +183,24 @@ class TestTextAnalyzer(unittest.IsolatedAsyncioTestCase):
         _, events = await analyze(np.zeros(9600, dtype=np.float32), prior("Hmm."), enabled=True)
         self.assertFalse(any(e["kind"] != LipsyncEventKind.SILENCE for e in events))
 
+    async def test_text_relieves_close_vowels_of_the_missing_f2_rule(self):
+        # The quickstart voice's /i/: F2 above the F2 band, so the slot stays
+        # empty and DSP alone reads the dark close vowel as a murmur. Untimed
+        # text with a nasal in the sentence vetoes nothing by itself; covered
+        # by text, the missing F2 no longer counts as nasal evidence.
+        close_i = synth_vowel(270, 3050, f3=3600, f0=180, secs=0.6)
+        murmur = synth_vowel(250, 1500, secs=0.6)
+
+        def nasals(events):
+            return sum(e["kind"] == LipsyncEventKind.NASAL for e in events)
+
+        self.assertGreater(nasals((await analyze(close_i))[1]), 0)
+        text = prior("Green trees.")
+        self.assertEqual(nasals((await analyze(close_i, text, enabled=True))[1]), 0)
+        # Murmur evidence that does not rest on a missing F2 still latches.
+        self.assertGreater(nasals((await analyze(murmur, text, enabled=True))[1]), 0)
+        self.assertGreater(nasals((await analyze(murmur, prior("Hmm."), enabled=True))[1]), 0)
+
     async def test_disabling_switch_preserves_all_output_even_with_text(self):
         pcm = synth_vowel(700, 1200, secs=0.6)
         self.assertEqual(await analyze(pcm, prior("Hmm.")), await analyze(pcm))
