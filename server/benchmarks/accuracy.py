@@ -39,6 +39,8 @@ from benchmarks.common import (
     teardowns_pending,
 )
 from benchmarks.text_timing import FixtureTextInputs
+from benchmarks.vowel_identity import VowelHops, vowel_hops, word_spans
+from benchmarks.vowel_identity import scores as vowel_scores
 from lipsync.base_lipsync_analyzer import LipsyncAnalysisContext
 from lipsync.formant_lipsync_analyzer import FormantLipsyncAnalyzer
 from lipsync.text_prior import TextAnchor, TextPrior
@@ -449,6 +451,22 @@ def run_checks(sentence: Sentence, metrics: dict[str, float]) -> dict[str, bool]
 #
 
 
+def clip_vowel_hops(clip: Clip, keyframes, debug, ref: Reference) -> VowelHops:
+    """Rendered rounding/width on the labelled vowels of one clip (see vowel_identity)."""
+    if len(keyframes) < 2:
+        return VowelHops([], [], [], [])
+    offsets = np.array([d.offset for d in debug])
+    kf_offs = np.array([k.offset for k in keyframes])
+    return vowel_hops(
+        word_spans(clip.text_timing, clip.duration_secs),
+        offsets,
+        np.array([d.rms for d in debug]),
+        ref.voiced,
+        np.interp(offsets, kf_offs, [k.rounding for k in keyframes]),
+        np.interp(offsets, kf_offs, [k.width for k in keyframes]),
+    )
+
+
 def _ramp(value: float, full: float, zero: float) -> float:
     if not np.isfinite(value):
         return float("nan")
@@ -484,6 +502,38 @@ def composite_score(results: list[ClipResult]) -> tuple[float, dict[str, float]]
 #
 # Reporting
 #
+
+
+def _finite(value):
+    """NaN-free copy of nested dicts for JSON (NaN becomes None)."""
+    if isinstance(value, dict):
+        return {k: _finite(v) for k, v in value.items()}
+    return value if not isinstance(value, float) or np.isfinite(value) else None
+
+
+def report_vowel_identity(vowel_identity: dict, baseline: dict | None):
+    """Per-voice rounding/width AUC against the words' dictionary vowels."""
+    before = (baseline or {}).get("vowel_identity") or {}
+    before_voices = before.get("voices", {})
+
+    def cell(now: dict, then: dict | None, key: str) -> str:
+        value = now.get(key)
+        text = _fmt(value)
+        if then and then.get(key) is not None and value is not None:
+            text += f" ({value - then[key]:+.2f})"
+        return text
+
+    rows = [("pooled", vowel_identity["pooled"], before.get("pooled"))] + [
+        (vid[:8], sc, before_voices.get(vid)) for vid, sc in vowel_identity["voices"].items()
+    ]
+    print("\nvowel identity (AUC vs dictionary vowels; 0.5 = no information)")
+    print(f"  {'voice':<10} {'rounding':>16} {'width':>16}  round on rounded / spread")
+    for name, now, then in rows:
+        print(
+            f"  {name:<10} {cell(now, then, 'rounding_auc'):>16} {cell(now, then, 'width_auc'):>16}"
+            f"  {_fmt(now.get('rounding_on_rounded'))} / {_fmt(now.get('rounding_on_spread'))}"
+            f"  (n {int(now.get('rounded_hops') or 0)}/{int(now.get('spread_hops') or 0)})"
+        )
 
 
 def _fmt(value, digits=2) -> str:
@@ -653,6 +703,7 @@ async def run(args) -> dict:
         voices = [Voice(v.provider, v.id, args.ceiling) for v in voices]
 
     results: list[ClipResult] = []
+    vowels_by_voice: dict[str, VowelHops] = {}
     for voice in voices:
         warm_pcm, warm_rate = None, 0
         if args.warm:
@@ -690,6 +741,9 @@ async def run(args) -> dict:
                 offsets = np.array([d.offset for d in debug])
                 ref = compute_reference(clip, offsets, voice.formant_ceiling)
                 metrics = compute_metrics(clip, keyframes, events, debug, ref)
+                vowels_by_voice.setdefault(voice.id, VowelHops([], [], [], [])).extend(
+                    clip_vowel_hops(clip, keyframes, debug, ref)
+                )
                 results.append(
                     ClipResult(
                         clip_label=clip.label,
@@ -705,6 +759,13 @@ async def run(args) -> dict:
                 )
 
     composite, comp_scores = composite_score(results)
+    pooled = VowelHops([], [], [], [])
+    for hops in vowels_by_voice.values():
+        pooled.extend(hops)
+    vowel_identity = {
+        "pooled": vowel_scores(pooled),
+        "voices": {vid: vowel_scores(hops) for vid, hops in vowels_by_voice.items()},
+    }
     aggregate = {}
     for r in results:
         for name in r.metrics:
@@ -732,6 +793,7 @@ async def run(args) -> dict:
         },
         "composite": composite,
         "component_scores": comp_scores,
+        "vowel_identity": _finite(vowel_identity),
         "aggregate": {k: (v if np.isfinite(v) else None) for k, v in aggregate.items()},
         "clips": [
             {
@@ -911,6 +973,7 @@ def main():
             print(f"no baseline at {compare_path}; reporting without comparison")
 
     report(results, payload["run"], baseline)
+    report_vowel_identity(payload["vowel_identity"], baseline)
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     stamp = args.tag or datetime.now().strftime("%Y%m%d-%H%M%S")
