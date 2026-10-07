@@ -85,3 +85,7 @@ examples:
     text: "I'm sorry to hear that. Would it help if we went through it step by step?"
     tags: [conversational]
     look_for: "Soft delivery: closures on I'm, step by step."
+  - id: counting
+    text: "Sure! One, two, three. Four, five, six."
+    tags: [conversational, vowel]
+    look_for: "Lips round on 'two' and 'four'; no lip closure on the t of 'two'."
