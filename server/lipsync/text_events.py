@@ -19,6 +19,14 @@ TOLERANCE = 0.060
 MAX_WORDS = 256
 MAX_PHONES = 2048
 MAX_WORD_LENGTH = 64
+# Word timestamps are converted to audio time against an estimate of when
+# the TTS started counting (word_start_pts), which on Cartesia lands words
+# ~0.1 s early (measured on the eval recording: up to 0.13 s), enough to put a
+# word's mouth shape on the end of the previous word. When the analyzer has
+# heard the utterance's speech onset, the first word is anchored there
+# instead — but only by a shift this small, so a misdetected onset cannot
+# move the whole sentence.
+ONSET_MAX_SHIFT = 0.3
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +73,7 @@ class TextEvents:
 
     def reset(self):
         self._prior = None
+        self._onset: float | None = None
         self._segments: list[_Segment] = []
         self._starts: list[float] = []
         self._spans: list[_Span] = []
@@ -76,11 +85,17 @@ class TextEvents:
         self._anchors_seen = 0
         self._available: dict[tuple[int, int], float] = {}
 
-    def prepare(self, prior: TextPrior | None, cursor: float = 0.0):
+    def prepare(self, prior: TextPrior | None, cursor: float = 0.0, onset: float | None = None):
+        """Rebuild segments and timed spans for ``prior``.
+
+        ``onset`` is the utterance's speech onset in audio seconds, once the
+        analyzer has heard it; word times are anchored on it (ONSET_MAX_SHIFT).
+        """
         analysis_cursor = cursor
-        if prior is self._prior:
+        if prior is self._prior and onset == self._onset:
             return
         self._prior = prior
+        self._onset = onset
         self._spans, self._span_starts = [], []
         self._segments, self._starts = [], []
         if prior is None or self._rejected or not prior.anchors:
@@ -145,6 +160,10 @@ class TextEvents:
         ):
             # Unknown clock origin: retain only the untimed inventory prior.
             return
+        if onset is not None:
+            shift = onset - points[0][1]
+            if abs(shift) <= ONSET_MAX_SHIFT:
+                points = [(word, t + shift) for word, t in points]
         i = 0
         while i < len(points):
             end = i + 1
@@ -187,6 +206,14 @@ class TextEvents:
                             cursor += step
             i = end
         self._span_starts = [s.start for s in self._spans]
+
+    def timed_words(self) -> list[tuple[float, float, tuple[tuple[str, float, float], ...]]]:
+        """Each timed word as (start, end, its phones as (phone, start, end))."""
+        words: dict[int, list] = {}
+        for s in self._spans:
+            entry = words.setdefault(s.identity[0], [s.word_start, s.word_end, []])
+            entry[2].append((s.phone, s.start, s.end))
+        return [(a, b, tuple(phones)) for a, b, phones in words.values()]
 
     def segment_at(self, offset: float) -> _Segment | None:
         i = bisect_right(self._starts, offset) - 1
