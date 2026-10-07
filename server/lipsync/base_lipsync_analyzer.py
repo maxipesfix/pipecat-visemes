@@ -130,6 +130,16 @@ class BaseLipsyncAnalyzer(ABC):
         """
         return []
 
+    def revise_events(
+        self, context: LipsyncAnalysisContext, events: list[LipsyncEvent], start: float
+    ) -> list[LipsyncEvent]:
+        """Held events of ``context`` (at or after ``start``) that should be dropped.
+
+        The counterpart of revise_keyframes for discrete events, called at the
+        same points. The base implementation drops nothing.
+        """
+        return []
+
     @abstractmethod
     async def reset(self):
         """Reset per-utterance state after an interruption.

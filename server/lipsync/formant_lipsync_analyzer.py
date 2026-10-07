@@ -537,6 +537,27 @@ class FormantLipsyncAnalyzer(BaseLipsyncAnalyzer):
                 keyframe.width = min(keyframe.width, _ROUNDED_HINT_MAX_WIDTH)
         return added
 
+    def revise_events(
+        self, context: LipsyncAnalysisContext, events: list[LipsyncEvent], start: float
+    ) -> list[LipsyncEvent]:
+        """Held nasal/closure events the now-timed text rules out.
+
+        A close vowel the DSP heard as a murmur (this voice's /u/ in "two")
+        latches NASAL before its word's timing arrives, and the client shuts
+        the lips on it; once the timing shows a non-nasal phone there, the
+        event is dropped before it is released.
+        """
+        if self._text_events is None or not events:
+            return []
+        self._text_events.prepare(context.text_prior, self._hops * HOP_SECONDS, self._speech_onset)
+        return [
+            e
+            for e in events
+            if e.offset >= start
+            and e.kind in (LipsyncEventKind.NASAL, LipsyncEventKind.CLOSURE)
+            and self._text_events.vetoes(e.kind, e.offset)
+        ]
+
     async def analyze(self, pcm: np.ndarray, context: LipsyncAnalysisContext) -> LipsyncFrameResult:
         """Analyze a chunk of PCM audio from one TTS context.
 

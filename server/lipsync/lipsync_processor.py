@@ -296,6 +296,7 @@ class LipsyncProcessor(FrameProcessor):
             "text_words": 0,
             "text_discarded": 0,
             "keyframes_revised_in": 0,
+            "events_revised_out": 0,
         }
 
     @property
@@ -727,7 +728,7 @@ class LipsyncProcessor(FrameProcessor):
             )
 
     def _revise_held(self, context: _Context):
-        """Let the analyzer revise this context's keyframes that are not yet out.
+        """Let the analyzer revise this context's keyframes and events not yet out.
 
         Held means still pending (not yet batched) or batched but waiting in
         the delivery queue for its release time. Word timings trail the audio
@@ -741,12 +742,19 @@ class LipsyncProcessor(FrameProcessor):
         held_frames = [
             frame for _, _, frame in self._scheduled if frame.context_id == context.context_id
         ]
+        start = min([f.window_start for f in held_frames] + [context.window_start])
+        events = [e for frame in held_frames for e in frame.events] + context.pending_events
+        dropped = {id(e) for e in self._analyzer.revise_events(context.analysis, events, start)}
+        if dropped:
+            for frame in held_frames:
+                frame.events = [e for e in frame.events if id(e) not in dropped]
+            context.pending_events = [e for e in context.pending_events if id(e) not in dropped]
+            self._stats["events_revised_out"] += len(dropped)
         keyframes = [k for frame in held_frames for k in frame.keyframes]
         keyframes += context.pending_keyframes
         if not keyframes:
             return
         keyframes.sort(key=lambda k: k.offset)
-        start = min([f.window_start for f in held_frames] + [context.window_start])
         added = self._analyzer.revise_keyframes(context.analysis, keyframes, start)
         for keyframe in added:
             frame = next(

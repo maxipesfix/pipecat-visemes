@@ -11,8 +11,8 @@ from lipsync.formant_lipsync_analyzer import FormantLipsyncAnalyzer
 from lipsync.frames import TTSLipsyncFrame
 from lipsync.lipsync_processor import LipsyncProcessor, _Context
 from lipsync.text_events import ONSET_MAX_SHIFT, TextEvents
-from lipsync.text_prior import TextWord
-from lipsync.types import LipsyncKeyframe
+from lipsync.text_prior import TextAnchor, TextPrior, TextWord
+from lipsync.types import LipsyncEventKind, LipsyncKeyframe
 from tests.test_text_events import prior
 
 
@@ -121,3 +121,74 @@ class TestProcessorRevision(unittest.TestCase):
         self.assertEqual([k.offset for k in held.keyframes], [0.05, 0.15, 0.18])
         self.assertEqual([k.offset for k in context.pending_keyframes], [0.22, 0.25])
         self.assertEqual(other.keyframes, [])
+
+
+def counting(*words):
+    """A streamed turn: three sentence anchors in one TTS context."""
+    return TextPrior(
+        anchors=(TextAnchor("Sure!"), TextAnchor("One, two, three."), TextAnchor("Bob.")),
+        words=tuple(words),
+        word_start_pts=0,
+    )
+
+
+TIMED = (
+    TextWord("Sure", 0),
+    TextWord("One", 500_000_000),
+    TextWord("two", 1_000_000_000),
+    TextWord("three", 1_400_000_000),
+    TextWord("Bob", 2_000_000_000),
+)
+
+
+class TestStreamedTurns(unittest.TestCase):
+    def test_sentences_are_aligned_by_their_first_word(self):
+        model = TextEvents()
+        model.prepare(counting(*TIMED))
+        self.assertEqual(model.segment_at(0.2).words, ("sure",))
+        self.assertEqual(model.segment_at(1.1).words, ("one", "two", "three"))
+        self.assertEqual(model.segment_at(2.1).words, ("bob",))
+
+    def test_a_sentence_without_timing_gets_no_inventory(self):
+        model = TextEvents()
+        model.prepare(counting(*TIMED[:1]))
+        # "Sure" is timed but its end is not: nothing is bounded yet, so the
+        # DSP alone decides, as before streamed turns were supported.
+        self.assertIsNone(model.segment_at(0.2))
+        self.assertIsNone(model.segment_at(1.1))
+
+    def test_words_ahead_of_their_sentence_wait_for_it(self):
+        prior = TextPrior(anchors=(TextAnchor("Sure!"),), words=TIMED[:3], word_start_pts=0)
+        model = TextEvents()
+        model.prepare(prior)
+        self.assertEqual(model.stats["mismatched_contexts"], 0)
+
+
+class TestEventVetoes(unittest.TestCase):
+    def setUp(self):
+        self.model = TextEvents()
+        self.model.prepare(counting(*TIMED))
+
+    def test_a_murmur_heard_in_a_close_vowel_is_dropped(self):
+        # "two" (1.0-1.4 s): its vowel, far from the /n/ ending "one".
+        self.assertTrue(self.model.vetoes(LipsyncEventKind.NASAL, 1.3))
+
+    def test_a_nasal_near_a_nasal_phone_is_kept(self):
+        # "one" is W AH N over 0.5-1.0 s: its /n/ spans ~0.83-1.0 s.
+        self.assertFalse(self.model.vetoes(LipsyncEventKind.NASAL, 0.9))
+
+    def test_closures_only_go_where_the_sentence_has_no_bilabial(self):
+        self.assertTrue(self.model.vetoes(LipsyncEventKind.CLOSURE, 1.1))  # One, two, three.
+        self.assertFalse(self.model.vetoes(LipsyncEventKind.CLOSURE, 2.05))  # Bob.
+
+    def test_hums_keep_their_nasals(self):
+        model = TextEvents()
+        model.prepare(
+            TextPrior(
+                anchors=(TextAnchor("Hmm."),),
+                words=(TextWord("Hmm", 0),),
+                word_start_pts=0,
+                audio_end=0.5,
+            )
+        )
+        self.assertFalse(model.vetoes(LipsyncEventKind.NASAL, 0.2))

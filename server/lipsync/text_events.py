@@ -27,6 +27,10 @@ MAX_WORD_LENGTH = 64
 # instead — but only by a shift this small, so a misdetected onset cannot
 # move the whole sentence.
 ONSET_MAX_SHIFT = 0.3
+# A held NASAL event this far from every timed nasal phone is dropped once
+# the timing arrives (vetoes): wider than the closure TOLERANCE, because
+# phones are placed uniformly within words.
+NASAL_VETO_MARGIN = 0.08
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +80,8 @@ class TextEvents:
         self._onset: float | None = None
         self._segments: list[_Segment] = []
         self._starts: list[float] = []
+        self._ends: list[float] = []
+        self._multi_counted = False
         self._spans: list[_Span] = []
         self._span_starts: list[float] = []
         self._claimed: set[tuple[int, int]] = set()
@@ -97,20 +103,23 @@ class TextEvents:
         self._prior = prior
         self._onset = onset
         self._spans, self._span_starts = [], []
-        self._segments, self._starts = [], []
+        self._segments, self._starts, self._ends = [], [], []
         if prior is None or self._rejected or not prior.anchors:
             return
         if prior.anchors[0].received_after_audio > TOLERANCE:
             self.stats["late_contexts"] += 1
             self._rejected = True
             return
-        if len(prior.anchors) > 1:
-            # Samples-at-arrival are NOT sentence onsets. Shared contexts
-            # require sentence alignment before inventory vetoes are safe.
+        if len(prior.anchors) > 1 and not self._multi_counted:
+            # Samples-at-arrival are NOT sentence onsets, so a shared context
+            # needs its sentences aligned before their inventories apply:
+            # each sentence covers audio from its first word's timestamp (see
+            # the segment bounds below). Every turn of a streaming LLM bot is
+            # one such context, sentence after sentence.
             self.stats["multi_anchor_contexts"] += 1
-            self._rejected = True
-            return
+            self._multi_counted = True
         all_words = []
+        sentences: list[tuple[float, tuple[str, ...], bool, tuple[str, ...]]] = []
         for index, anchor in enumerate(prior.anchors):
             words = tokenize(anchor.text)
             if len(words) > MAX_WORDS or any(len(word) > MAX_WORD_LENGTH for word in words):
@@ -126,16 +135,7 @@ class TextEvents:
                 self.stats["oversized_contexts"] += 1
                 self._rejected = True
                 return
-            segment = _Segment(
-                anchor.received_after_audio,
-                words,
-                trusted,
-                bool(BILABIALS.intersection(phones)),
-                bool(NASALS.intersection(phones)),
-                trusted and bool(phones) and all(p == "M" for p in phones),
-            )
-            self._segments.append(segment)
-            self._starts.append(segment.start)
+            sentences.append((anchor.received_after_audio, words, trusted, phones))
             all_words.extend(words)
             if index >= self._anchors_seen:
                 self.stats["segments"] += 1
@@ -147,23 +147,74 @@ class TextEvents:
         for word in prior.words:
             for token in tokenize(word.text):
                 observed.append((token, word.pts))
+        # Words timed ahead of their sentence's text wait for it.
+        observed = observed[: len(all_words)]
         if [word for word, _ in observed] != all_words[: len(observed)]:
             self.stats["mismatched_contexts"] += 1
             self._rejected = True
-            self._segments, self._starts = [], []
             return
-        if prior.word_start_pts is None or not observed:
-            return
-        points = [(word, (pts - prior.word_start_pts) / 1e9) for word, pts in observed]
-        if any(t < -0.020 for _, t in points) or any(
-            b[1] < a[1] for a, b in zip(points, points[1:])
-        ):
-            # Unknown clock origin: retain only the untimed inventory prior.
-            return
-        if onset is not None:
+        points = []
+        if prior.word_start_pts is not None and observed:
+            points = [(word, (pts - prior.word_start_pts) / 1e9) for word, pts in observed]
+            if any(t < -0.020 for _, t in points) or any(
+                b[1] < a[1] for a, b in zip(points, points[1:])
+            ):
+                # Unknown clock origin: retain only the untimed inventory prior.
+                points = []
+        if points and onset is not None:
             shift = onset - points[0][1]
             if abs(shift) <= ONSET_MAX_SHIFT:
                 points = [(word, t + shift) for word, t in points]
+        self._build_spans(prior, points, analysis_cursor)
+        self._build_segments(sentences, points)
+
+    def _build_segments(self, sentences, points: list[tuple[str, float]]):
+        """Bound each sentence's stretch of audio, where its inventory applies.
+
+        The first sentence starts where it always did (its arrival); a later
+        one at its first word's timestamp. A sentence ends where the next one
+        starts, or failing that at its own last timed word; the last one is
+        open-ended. A sentence that cannot be bounded yet gets no segment —
+        DSP alone decides there, exactly as without text.
+        """
+        word_ends = {s.identity[0]: s.word_end for s in self._spans}
+        firsts, count = [], 0
+        for _, words, _, _ in sentences:
+            firsts.append(count)
+            count += len(words)
+        starts: list[float | None] = []
+        for index, (received, words, _, _) in enumerate(sentences):
+            if index == 0:
+                starts.append(received)
+            elif words and firsts[index] < len(points):
+                starts.append(points[firsts[index]][1])
+            else:
+                starts.append(None)
+        for index, (_, words, trusted, phones) in enumerate(sentences):
+            start = starts[index]
+            if index == len(sentences) - 1:
+                end = float("inf")
+            elif starts[index + 1] is not None:
+                end = starts[index + 1]
+            else:
+                end = word_ends.get(firsts[index + 1] - 1)
+            if start is None or end is None or end <= start:
+                continue
+            self._segments.append(
+                _Segment(
+                    start,
+                    words,
+                    trusted,
+                    bool(BILABIALS.intersection(phones)),
+                    bool(NASALS.intersection(phones)),
+                    trusted and bool(phones) and all(p == "M" for p in phones),
+                )
+            )
+            self._starts.append(start)
+            self._ends.append(end)
+
+    def _build_spans(self, prior, points, analysis_cursor):
+        """Timed phone spans from the word timestamps (uniform within a word)."""
         i = 0
         while i < len(points):
             end = i + 1
@@ -217,7 +268,7 @@ class TextEvents:
 
     def segment_at(self, offset: float) -> _Segment | None:
         i = bisect_right(self._starts, offset) - 1
-        if i < 0 or not self._segments[i].trusted:
+        if i < 0 or offset >= self._ends[i] or not self._segments[i].trusted:
             return None
         return self._segments[i]
 
@@ -276,6 +327,37 @@ class TextEvents:
             return False
         self._claimed.add(target.identity)
         return True
+
+    def vetoes(self, kind: LipsyncEventKind, offset: float) -> bool:
+        """Whether the text now rules out an event the DSP already emitted.
+
+        For events still held when the word timings that decide them arrive.
+        Deliberately more conservative than the live rules: phones are placed
+        uniformly within words, so a real /m/ can sit well away from its span
+        (measured on the eval recording, a span-level closure veto cut "Mama
+        made more mashed potatoes" from 7 closures to 4).
+
+        - A closure only in a sentence with no /b p m/ at all.
+        - A nasal in a sentence with no /m n ng/, or more than
+          NASAL_VETO_MARGIN from any timed nasal phone — the murmur the DSP
+          hears in a close vowel ("two", ~130 ms from the /n/ of "one").
+          Written hums keep their nasals.
+        """
+        segment = self.segment_at(offset)
+        if segment is None:
+            return False
+        if kind == LipsyncEventKind.CLOSURE:
+            return not segment.has_bilabial
+        if kind != LipsyncEventKind.NASAL or segment.hum:
+            return False
+        if not segment.has_nasal:
+            return True
+        if self.span_at(offset) is None:
+            return False  # untimed here: keep the DSP's evidence
+        return not any(
+            s.phone in NASALS and s.start - NASAL_VETO_MARGIN <= offset < s.end + NASAL_VETO_MARGIN
+            for s in self._spans
+        )
 
     def _nearby(self, offset: float):
         start = max(0, bisect_right(self._span_starts, offset - TOLERANCE) - 1)
