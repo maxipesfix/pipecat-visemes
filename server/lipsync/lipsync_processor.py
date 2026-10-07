@@ -295,6 +295,7 @@ class LipsyncProcessor(FrameProcessor):
             "text_anchors": 0,
             "text_words": 0,
             "text_discarded": 0,
+            "keyframes_revised_in": 0,
         }
 
     @property
@@ -675,6 +676,7 @@ class LipsyncProcessor(FrameProcessor):
             if generation != self._generation:
                 return
             self._merge_result(context, result)
+            self._revise_held(context)
             await self._emit_batches(context, generation, final=False)
             if generation != self._generation:
                 return
@@ -685,6 +687,7 @@ class LipsyncProcessor(FrameProcessor):
             if generation != self._generation:
                 return
             self._merge_result(context, result)
+            self._revise_held(context)
             await self._emit_batches(context, generation, final=True)
             if context in self._contexts:
                 self._contexts.remove(context)
@@ -722,6 +725,42 @@ class LipsyncProcessor(FrameProcessor):
                     confidence=0.1,
                 )
             )
+
+    def _revise_held(self, context: _Context):
+        """Let the analyzer revise this context's keyframes that are not yet out.
+
+        Held means still pending (not yet batched) or batched but waiting in
+        the delivery queue for its release time. Word timings trail the audio
+        they describe, so what the analyzer learns from them arrives after the
+        keyframes it applies to were analyzed — but usually long before they
+        are released. Skipped while dropped audio has shifted offsets
+        (``skip_offset``): the analyzer's offsets would no longer line up.
+        """
+        if context.skip_offset:
+            return
+        held_frames = [
+            frame for _, _, frame in self._scheduled if frame.context_id == context.context_id
+        ]
+        keyframes = [k for frame in held_frames for k in frame.keyframes]
+        keyframes += context.pending_keyframes
+        if not keyframes:
+            return
+        keyframes.sort(key=lambda k: k.offset)
+        start = min([f.window_start for f in held_frames] + [context.window_start])
+        added = self._analyzer.revise_keyframes(context.analysis, keyframes, start)
+        for keyframe in added:
+            frame = next(
+                (f for f in held_frames if f.window_start <= keyframe.offset < f.window_end),
+                None,
+            )
+            if frame is not None:
+                frame.keyframes.append(keyframe)
+                frame.keyframes.sort(key=lambda k: k.offset)
+            elif keyframe.offset >= context.window_start:
+                context.pending_keyframes.append(keyframe)
+        if added:
+            context.pending_keyframes.sort(key=lambda k: k.offset)
+            self._stats["keyframes_revised_in"] += len(added)
 
     async def _emit_batches(
         self, context: _Context, generation: int, final: bool, idle: bool = False

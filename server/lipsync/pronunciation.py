@@ -18,6 +18,7 @@ PHONES = tuple(
 BILABIALS = frozenset(("P", "B", "M"))
 NASALS = frozenset(("M", "N", "NG"))
 ROUNDED = frozenset(("UW", "OW", "W"))
+VOWELS = frozenset("AA AE AH AO AW AY EH ER EY IH IY OW OY UH UW".split())
 LABIODENTALS = frozenset(("F", "V"))
 _WORDS = re.compile(r"[a-z]+(?:'[a-z]+)*")
 _MAGIC = b"LPCMUD1\0"

@@ -114,6 +114,22 @@ class BaseLipsyncAnalyzer(ABC):
         """
         pass
 
+    def revise_keyframes(
+        self, context: LipsyncAnalysisContext, keyframes: list[LipsyncKeyframe], start: float
+    ) -> list[LipsyncKeyframe]:
+        """Revise keyframes that are analyzed but not yet released to clients.
+
+        Called by the processor whenever new information about the utterance
+        may have arrived (e.g. word timings, which trail the audio they
+        describe). ``keyframes`` are every held keyframe of ``context`` at or
+        after ``start``, in offset order; they may be modified in place.
+
+        Returns:
+            New keyframes to add to the held ones (already revised). The base
+            implementation revises nothing.
+        """
+        return []
+
     @abstractmethod
     async def reset(self):
         """Reset per-utterance state after an interruption.

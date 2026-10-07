@@ -22,7 +22,7 @@ from lipsync.base_lipsync_analyzer import (
     LipsyncAnalysisContext,
     LipsyncFrameResult,
 )
-from lipsync.pronunciation import load_lexicon
+from lipsync.pronunciation import ROUNDED, VOWELS, load_lexicon
 from lipsync.text_events import TextEvents
 from lipsync.types import LipsyncEvent, LipsyncEventKind, LipsyncKeyframe
 
@@ -180,6 +180,14 @@ _NASAL_OPENNESS_MAX = 0.15
 # above F1) keeps at least this opening: its F1 (~210-300 Hz on the corpus
 # voices) sits at the learned floor and would otherwise map to a shut mouth.
 _ROUNDED_VOWEL_MIN_OPENNESS = 0.1
+# Text-tier shape hint on a timed rounded phone (/u o w/): the lips round and
+# narrow whatever the formants say. Applied live on hops whose word timing is
+# known, and to held keyframes once it arrives (revise_keyframes).
+_ROUNDED_HINT_MIN_ROUNDING = 0.7
+_ROUNDED_HINT_MAX_WIDTH = 0.25
+# Held keyframes at or below this energy are rest/silence poses; the rounding
+# hint leaves them alone, as the live hint does for unvoiced hops.
+_REVISE_MIN_ENERGY = 0.05
 # Rounding is gated off only for wide-open mouths (a low-side gate on
 # openness zeroed the rounding of /u/, whose opening is small by nature).
 _ROUNDING_OPEN_GATE = (0.75, 0.9)
@@ -468,6 +476,67 @@ class FormantLipsyncAnalyzer(BaseLipsyncAnalyzer):
         elif not enabled:
             self._text_events = None
 
+    def revise_keyframes(
+        self, context: LipsyncAnalysisContext, keyframes: list[LipsyncKeyframe], start: float
+    ) -> list[LipsyncKeyframe]:
+        """Apply the rounded-phone hint to held keyframes once word timings arrive.
+
+        Word timestamps trail the audio they describe (Cartesia: ~0.1-0.6 s),
+        so the live hint rarely sees them; but analyzed keyframes wait in the
+        processor's delivery queue until shortly before playout, often for
+        over a second. Revising them there costs no latency.
+
+        Where the hint goes: phones are placed uniformly within a word, and a
+        word's interval runs to the next word's start, pauses included — so in
+        "blue, and" the uniform /u/ lands partly in the comma's silence. For a
+        word whose only vowel is rounded, the vowel is instead the loud core of
+        the word (keyframes at or above half its peak energy), where a vowel
+        actually is. Other rounded phones (/w/, vowels of longer words) keep
+        their uniform span.
+
+        Keyframes are sparse (dead-band): each hinted stretch gets keyframes
+        interpolated in just outside and just inside both edges, so the hint
+        neither misses a vowel lying between two keyframes nor bleeds into the
+        next word through the client's interpolation.
+        """
+        if self._text_events is None or not keyframes:
+            return []
+        self._text_events.prepare(context.text_prior, self._hops * HOP_SECONDS, self._speech_onset)
+        stretches = []
+        for word_start, word_end, phones in self._text_events.timed_words():
+            if word_end <= start:
+                continue
+            vowels = [phone for phone, _, _ in phones if phone in VOWELS]
+            core = (
+                _loud_core(keyframes, word_start, word_end)
+                if len(vowels) == 1 and vowels[0] in ROUNDED
+                else None
+            )
+            if core is not None:
+                stretches.append(core)
+            else:
+                stretches += [(a, b) for phone, a, b in phones if phone in ROUNDED]
+        stretches = [(max(a, start), b) for a, b in stretches if b > start and b > a]
+        if not stretches:
+            return []
+
+        half = HOP_SECONDS / 2
+        offsets = [k.offset for k in keyframes]
+        added: list[LipsyncKeyframe] = []
+        for a, b in stretches:
+            for t in (a - half, a, b - half, b):
+                if t >= start and not any(abs(o - t) < half / 2 for o in offsets):
+                    # Interpolated from the original keyframes, before any hint.
+                    added.append(_interpolate_keyframe(keyframes, t))
+                    offsets.append(t)
+        for keyframe in [*keyframes, *added]:
+            if keyframe.energy <= _REVISE_MIN_ENERGY:
+                continue
+            if any(a <= keyframe.offset < b for a, b in stretches):
+                keyframe.rounding = max(keyframe.rounding, _ROUNDED_HINT_MIN_ROUNDING)
+                keyframe.width = min(keyframe.width, _ROUNDED_HINT_MAX_WIDTH)
+        return added
+
     async def analyze(self, pcm: np.ndarray, context: LipsyncAnalysisContext) -> LipsyncFrameResult:
         """Analyze a chunk of PCM audio from one TTS context.
 
@@ -479,7 +548,9 @@ class FormantLipsyncAnalyzer(BaseLipsyncAnalyzer):
             Keyframes and events measured from the chunk.
         """
         if self._text_events is not None:
-            self._text_events.prepare(context.text_prior, self._hops * HOP_SECONDS)
+            self._text_events.prepare(
+                context.text_prior, self._hops * HOP_SECONDS, self._speech_onset
+            )
         result = LipsyncFrameResult()
         remaining = pcm
         while remaining.size:
@@ -506,7 +577,9 @@ class FormantLipsyncAnalyzer(BaseLipsyncAnalyzer):
             ``processed_up_to`` advanced past everything ingested.
         """
         if self._text_events is not None:
-            self._text_events.prepare(context.text_prior, self._hops * HOP_SECONDS)
+            self._text_events.prepare(
+                context.text_prior, self._hops * HOP_SECONDS, self._speech_onset
+            )
         result = LipsyncFrameResult()
         # The wider frames look ``_pad`` samples past the 25 ms frame: pad with
         # zeros so every complete 25 ms frame is still analyzed.
@@ -557,6 +630,8 @@ class FormantLipsyncAnalyzer(BaseLipsyncAnalyzer):
     def _reset_utterance_state(self):
         if self._text_events is not None:
             self._text_events.reset()
+        # First hop of this utterance heard as speech; anchors word timings.
+        self._speech_onset: float | None = None
         # The buffer leads with the widest frame's left context (zeros at the
         # utterance start), so buffer index 0 is that frame's first start.
         self._buf[: self._pad] = 0.0
@@ -793,6 +868,8 @@ class FormantLipsyncAnalyzer(BaseLipsyncAnalyzer):
         speech = rms > 2.0 * max(
             _CLOSURE_FLOOR_MULT * self._noise_floor, _CLOSURE_PEAK_FRACTION * self._recent_peak
         )
+        if speech and self._speech_onset is None:
+            self._speech_onset = offset
         murmur_shape = (f1 <= _NASAL_F1_MAX_HZ or f1 == 0.0) and mid_ratio <= _NASAL_MID_RATIO_MAX
         nasal_hint, phone = None, None
         if self._text_events is not None:
@@ -835,9 +912,9 @@ class FormantLipsyncAnalyzer(BaseLipsyncAnalyzer):
                 openness = min(openness, 0.10)
             elif phone in ("P", "B") and rms < 0.5 * self._recent_peak:
                 openness = min(openness, 0.10)
-            elif phone in ("UW", "OW", "W") and voiced:
-                rounding = max(rounding, 0.7)
-                width = min(width, 0.25)
+            elif phone in ROUNDED and voiced:
+                rounding = max(rounding, _ROUNDED_HINT_MIN_ROUNDING)
+                width = min(width, _ROUNDED_HINT_MAX_WIDTH)
             elif phone in ("F", "V") and rms >= silence_gate:
                 openness = min(openness, 0.25)
                 rounding = 0.0
@@ -1253,3 +1330,41 @@ class FormantLipsyncAnalyzer(BaseLipsyncAnalyzer):
                 confidence=hop.confidence,
             )
         )
+
+
+def _loud_core(
+    keyframes: list[LipsyncKeyframe], start: float, end: float
+) -> tuple[float, float] | None:
+    """The stretch of a word at or above half its peak energy, if measurable."""
+    inside = [k for k in keyframes if start <= k.offset < end]
+    if len(inside) < 2:
+        return None
+    peak = max(k.energy for k in inside)
+    if peak <= _REVISE_MIN_ENERGY:
+        return None
+    loud = [k.offset for k in inside if k.energy >= 0.5 * peak]
+    return loud[0], min(end, loud[-1] + HOP_SECONDS)
+
+
+def _interpolate_keyframe(keyframes: list[LipsyncKeyframe], offset: float) -> LipsyncKeyframe:
+    """The pose clients would interpolate at ``offset`` (held at either end)."""
+    before = [k for k in keyframes if k.offset <= offset]
+    after = [k for k in keyframes if k.offset > offset]
+    if not before or not after:
+        nearest = before[-1] if before else after[0]
+        return LipsyncKeyframe(**{**vars(nearest), "offset": offset})
+    k0, k1 = before[-1], after[0]
+    t = (offset - k0.offset) / (k1.offset - k0.offset)
+
+    def lerp(name: str) -> float:
+        return getattr(k0, name) + (getattr(k1, name) - getattr(k0, name)) * t
+
+    return LipsyncKeyframe(
+        offset=offset,
+        openness=lerp("openness"),
+        width=lerp("width"),
+        rounding=lerp("rounding"),
+        energy=lerp("energy"),
+        pitch=lerp("pitch"),
+        confidence=lerp("confidence"),
+    )
