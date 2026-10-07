@@ -67,6 +67,7 @@ _REST_EPSILON = 0.02
 # Generic formant priors (Hz); shifted up for high-pitched voices.
 _F1_PRIOR = (250.0, 900.0)
 _F2_PRIOR = (800.0, 2500.0)
+_F3_PRIOR = (2200.0, 3200.0)
 _HIGH_PITCH_HZ = 180.0
 _PRIOR_SHIFT = 1.12
 _PITCH_PROBE_FRAMES = 10
@@ -172,6 +173,17 @@ _ROUNDED_VOWEL_MIN_OPENNESS = 0.1
 # Rounding is gated off only for wide-open mouths (a low-side gate on
 # openness zeroed the rounding of /u/, whose opening is small by nature).
 _ROUNDING_OPEN_GATE = (0.75, 0.9)
+# Rounding evidence from F3. Lip rounding lengthens the vocal tract and
+# lowers every formant; F2 is the classic cue but American /u o/ are fronted
+# (F2 ~1600-2100 Hz on the quickstart voice, above its learned F2 midpoint),
+# so the F2 term reads them as spread. F3 still drops for them (~2650-2750 Hz
+# against ~2900-3600 for /i e a/). How the two terms combine:
+#   "off"  F2 only (the previous behaviour)
+#   "max"  either cue may supply the rounding
+#   "mean" both must agree
+# The F3 term is used only on hops where F3 was found this hop — it is found
+# least on rounded vowels, and a held F3 says nothing about this hop.
+_ROUNDING_F3_MODE = "off"
 # Pre-latch soft cap: nasal-ish voiced frames cap openness before the event
 # state machine latches, so the continuous signal reacts within one hop.
 _NASAL_SOFT_CAP_OPENNESS = 0.2
@@ -515,11 +527,14 @@ class FormantLipsyncAnalyzer(BaseLipsyncAnalyzer):
         self._f1_p95 = dsp.P2QuantileEstimator(0.90)
         self._f2_p5 = dsp.P2QuantileEstimator(0.10)
         self._f2_p95 = dsp.P2QuantileEstimator(0.90)
+        self._f3_p5 = dsp.P2QuantileEstimator(0.10)
+        self._f3_p95 = dsp.P2QuantileEstimator(0.90)
         self._pitch_p5 = dsp.P2QuantileEstimator(0.05)
         self._pitch_p95 = dsp.P2QuantileEstimator(0.95)
         self._voiced_frames = 0
         self._f1_prior = _F1_PRIOR
         self._f2_prior = _F2_PRIOR
+        self._f3_prior = _F3_PRIOR
         self._pitch_probe: list[float] = []
         self._priors_shifted = False
         self._shift_ring: list[float] = []
@@ -542,8 +557,8 @@ class FormantLipsyncAnalyzer(BaseLipsyncAnalyzer):
         self._prev_f2 = 0.0
         self._prev_f3 = 0.0
         self._hold_counts = [0, 0]
-        self._last_adapt = [0.0, 0.0]
-        self._adapt_skips = [0, 0]
+        self._last_adapt = [0.0, 0.0, 0.0]
+        self._adapt_skips = [0, 0, 0]
         self._prev_targets = [_NEUTRAL, _NEUTRAL, _NEUTRAL]  # openness, width, rounding
         self._median_hist: list[list[float]] = []  # last _MEDIAN_TAPS target vectors
         self._pending_hop: _PendingHop | None = None
@@ -719,21 +734,30 @@ class FormantLipsyncAnalyzer(BaseLipsyncAnalyzer):
         # Adaptive normalization updates (voiced frames only; found slots only,
         # so held values never pollute the learned ranges).
         if voiced:
-            self._update_adaptation(f1, f2, pitch_hz, f1_found, f2_found)
+            self._update_adaptation(f1, f2, f3, pitch_hz, f1_found, f2_found, f3_found)
         if self._prior_decay > 0.0:
             self._prior_decay = max(0.0, self._prior_decay - _SHIFT_DECAY_PER_HOP)
 
         f1_lo, f1_hi = self._effective_range(self._f1_p5, self._f1_p95, self._f1_prior)
         f2_lo, f2_hi = self._effective_range(self._f2_p5, self._f2_p95, self._f2_prior)
+        f3_lo, f3_hi = self._effective_range(self._f3_p5, self._f3_p95, self._f3_prior)
 
         # Continuous parameter targets.
         if voiced and f1 > 0.0:
             openness = _clamp01((f1 - f1_lo) / (f1_hi - f1_lo + dsp.EPSILON))
             width = _clamp01((f2 - f2_lo) / (f2_hi - f2_lo + dsp.EPSILON))
             f2_mid = (f2_lo + f2_hi) / 2.0
-            rounding = _clamp01((f2_mid - f2) / (f2_mid - f2_lo + dsp.EPSILON)) * (
-                1.0 - _smoothstep(openness, *_ROUNDING_OPEN_GATE)
-            )
+            rounding = _clamp01((f2_mid - f2) / (f2_mid - f2_lo + dsp.EPSILON))
+            if f3_found and _ROUNDING_F3_MODE != "off":
+                f3_mid = (f3_lo + f3_hi) / 2.0
+                f3_rounding = _clamp01((f3_mid - f3) / (f3_mid - f3_lo + dsp.EPSILON))
+                if _ROUNDING_F3_MODE == "max":
+                    rounding = max(rounding, f3_rounding)
+                elif _ROUNDING_F3_MODE == "mean":
+                    rounding = (rounding + f3_rounding) / 2.0
+                else:
+                    raise ValueError(f"unknown _ROUNDING_F3_MODE {_ROUNDING_F3_MODE!r}")
+            rounding *= 1.0 - _smoothstep(openness, *_ROUNDING_OPEN_GATE)
             if vowel_f2:
                 openness = max(openness, _ROUNDED_VOWEL_MIN_OPENNESS)
         else:
@@ -908,7 +932,14 @@ class FormantLipsyncAnalyzer(BaseLipsyncAnalyzer):
         windowed *= self._window
 
     def _update_adaptation(
-        self, f1: float, f2: float, pitch_hz: float, f1_found: bool, f2_found: bool
+        self,
+        f1: float,
+        f2: float,
+        f3: float,
+        pitch_hz: float,
+        f1_found: bool,
+        f2_found: bool,
+        f3_found: bool,
     ):
         self._voiced_frames += 1
 
@@ -920,6 +951,7 @@ class FormantLipsyncAnalyzer(BaseLipsyncAnalyzer):
                 if float(np.median(self._pitch_probe)) > _HIGH_PITCH_HZ:
                     self._f1_prior = (_F1_PRIOR[0] * _PRIOR_SHIFT, _F1_PRIOR[1] * _PRIOR_SHIFT)
                     self._f2_prior = (_F2_PRIOR[0] * _PRIOR_SHIFT, _F2_PRIOR[1] * _PRIOR_SHIFT)
+                    self._f3_prior = (_F3_PRIOR[0] * _PRIOR_SHIFT, _F3_PRIOR[1] * _PRIOR_SHIFT)
 
         if f1_found and self._accept_adaptation(0, f1):
             self._f1_p5.add(f1)
@@ -937,6 +969,9 @@ class FormantLipsyncAnalyzer(BaseLipsyncAnalyzer):
         if f2_found and self._accept_adaptation(1, f2):
             self._f2_p5.add(f2)
             self._f2_p95.add(f2)
+        if f3_found and self._accept_adaptation(2, f3):
+            self._f3_p5.add(f3)
+            self._f3_p95.add(f3)
         if pitch_hz > 0.0:
             self._pitch_p5.add(pitch_hz)
             self._pitch_p95.add(pitch_hz)
