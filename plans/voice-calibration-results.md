@@ -33,8 +33,9 @@ and a clean held-out set ("Now say boot, please.", different words from calibrat
 | Piece | What it does |
 |---|---|
 | `lipsync/voice_profile.py` | `VoiceProfile`: one exemplar per calibration *word* (median F1/F2/F3, how often F2 went unfound), scored with a pooled covariance; a missing F2 is evidence in itself. Rounding = posterior-weighted rounding of the exemplars' vowels (targets from `plans/experiments/l4_proto.py`). Per word, not per vowel, because one voice says /u/ in two places. |
-| `lipsync/calibration.py` | 36 words as a list ("Heed. Tea. Bead. ..."), every vowel, /u/ after lip-closing and tongue-front consonants. Each word is its own burst of speech, found by energy (13 of 14 recordings matched the word count exactly; word timestamps are the fallback). The analyzer's own measurements become the profile. |
+| `lipsync/calibration.py` | 36 words plus two hums as a list ("Heed. Tea. Bead. ... Hmm. Mmm."), every vowel, /u/ after lip-closing and tongue-front consonants. Each word is its own burst of speech, found by energy (13 of 14 recordings matched the word count exactly; word timestamps are the fallback). The analyzer's own measurements become the profile. |
 | Analyzer | `FormantLipsyncAnalyzer(voice_profile=…)`: rounding from the profile on hops with a measured F1. Width and openness stay on the formant mapping (`_PROFILE_WIDTH_WEIGHT = 0`, see below). About +10 µs per hop (151 → 161 µs). |
+| Nasal decision | The hums become exemplars too. Below 0.1 probability of being this voice's hum, a hop cannot latch NASAL (`_PROFILE_NASAL_VETO`); at 0.7 or above it counts as nasal even if the fixed thresholds miss it (`_PROFILE_NASAL_SUPPORT`). Text, when it votes, wins. |
 | Online learning (experimental) | `ProfileLearner`: adds the voice's own finished single-vowel dictionary words (TTS word timestamps, shifted 0.1 s) as exemplars during a session; calibration exemplars stay as measured; reducible function words ("to", "you", "the") are skipped. |
 | Processor | `LipsyncParams(voice_profile_path=…, voice_profile_learning=False)`. |
 | Benchmark | `python -m benchmarks.calibrate` records the list per corpus voice (cached under `fixtures/<provider>/<voice>/calibration/`) and writes profiles; `accuracy --voice-profiles DIR [--online-profiles]` scores with them. |
@@ -67,6 +68,29 @@ Composite 83.9 in all four. Calibration improves six of seven voices. Online lea
 voice and hurts others: learned exemplars come from words whose timestamps are 0.1-0.25 s off, so it
 stays off by default.
 
+### The nasal detector
+
+The fixed nasal thresholds read the dark, quiet tail of a fronted /u/ ("who") as a hum and shut the
+lips; on deep voices they miss real hums. Per voice, a hum is separable from that voice's vowels on
+F1/F2/F3 alone (cross-validated AUC 0.82-0.99; adding centroid and band energies does not help
+consistently), so the profile records the voice's hums and votes. Seven voices, two takes, sound
+only, calibrated:
+
+| Run | Composite | Nasal checks | Nasal time (share of voiced hops) |
+|---|---|---|---|
+| Baseline, no profile | 84.1 | 100/112 | 0.06 |
+| Profile, no nasal vote | 84.1 | 100/112 | 0.06 |
+| Veto below 0.1 | 84.1 | 101/112 | 0.02 |
+| Veto + support at 0.9 / 0.8 | 84.2 / 84.3 | 103 / 104 | 0.04 / 0.05 |
+| **Veto + support at 0.7** (default) | **84.4** | **105/112** | 0.05 |
+| Veto + support at 0.6 | 84.4 | 105/112 | 0.06 |
+
+The check that flips with the veto is the bot voice's "Soon the new moon grew blue..." (too much
+nasal); support adds detected hums ("Hmm. Hmm, hmm.") on deep voices. On the vowel probe (vrm-lipsync),
+false nasal latches across the 21 clips drop with calibration: 17 -> 5 on `71a7ad14` (6 -> 1 on the
+"oo" words), 3 -> 0 on `47c38ca4`, 4 -> 2, 5 -> 2, 5 -> 3 on three others; vowels rendered right are
+unchanged on five voices and one lower on two.
+
 ## Still open
 
 - **`ef191366` gets worse with calibration** (0.71 → 0.65); not yet diagnosed.
@@ -85,7 +109,7 @@ stays off by default.
 
 ```bash
 cd server
-uv run python -m benchmarks.calibrate                       # records the word list once per voice (CARTESIA_API_KEY)
+uv run python -m benchmarks.calibrate                       # records the word list (and hums) once per voice (CARTESIA_API_KEY)
 uv run python -m benchmarks.accuracy --offline --tag base
 uv run python -m benchmarks.accuracy --offline --voice-profiles benchmarks/results/profiles/cartesia --compare benchmarks/results/accuracy-base.json
 uv run python -m benchmarks.accuracy --offline --takes 1 --voice-profiles benchmarks/results/profiles/cartesia --online-profiles

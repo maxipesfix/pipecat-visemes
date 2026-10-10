@@ -215,3 +215,14 @@ def test_processor_loads_a_profile_and_learning_collects_text(tmp_path):
     assert len(calibrated._analyzer._voice_profile.exemplars) == 5
     learning = LipsyncProcessor(params=LipsyncParams(voice_profile_learning=True))
     assert learning._collect_text and learning._analyzer._profile_learner is not None
+
+
+def test_a_profile_with_hums_tells_a_dark_oo_from_a_hum():
+    profile = VoiceProfile.fit(FRONTED + hops("hmm", "M", 280, 0, 2600, f2_missing=0.9))
+    assert profile.has_nasal
+    assert profile.nasal(285.0, 0.0, 2600.0) > 0.7  # this voice's hum
+    assert profile.nasal(350.0, 1600.0, 2700.0) < 0.1  # its "boo"
+    # Hums shape no vowel: rounding comes from the vowel exemplars only.
+    _, rounding, _ = profile.articulation(350.0, 1600.0, 2700.0)
+    assert rounding > 0.7
+    assert not VoiceProfile.fit(FRONTED).has_nasal

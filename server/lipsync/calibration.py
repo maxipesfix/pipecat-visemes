@@ -17,7 +17,9 @@ analyzer sees live.
 
 The words cover every vowel the mapping targets, each after both a
 lip-closing and a tongue-front consonant where it matters: one voice can say
-/u/ at two places ("boo" vs "two").
+/u/ at two places ("boo" vs "two"). Two hums ("Hmm. Mmm.") record the voice's
+nasal murmur, so the analyzer can tell a dark, quiet vowel (the tail of
+"who") from a hum.
 """
 
 import numpy as np
@@ -25,7 +27,7 @@ import numpy as np
 from lipsync.base_lipsync_analyzer import LipsyncAnalysisContext
 from lipsync.dsp import ANALYSIS_SAMPLE_RATE
 from lipsync.formant_lipsync_analyzer import FormantLipsyncAnalyzer
-from lipsync.voice_profile import FormantSample, VoiceProfile
+from lipsync.voice_profile import NASAL, FormantSample, VoiceProfile
 
 CALIBRATION_WORDS: dict[str, str] = {
     "heed": "IY", "tea": "IY", "bead": "IY", "knee": "IY",
@@ -38,6 +40,7 @@ CALIBRATION_WORDS: dict[str, str] = {
     "hoed": "OW", "toe": "OW", "dough": "OW", "bode": "OW",
     "hood": "UH", "took": "UH", "put": "UH",
     "who'd": "UW", "two": "UW", "new": "UW", "do": "UW", "boo": "UW", "moo": "UW",
+    "hmm": NASAL, "mmm": NASAL,
 }  # fmt: skip
 
 # Bursts: energy above this fraction of the recording's peak, bridging dips

@@ -232,6 +232,16 @@ _C_FIT_LOG10_FULL = 3.2
 # the profile's (1 = all the way). Openness always stays on the F1 mapping.
 _PROFILE_ROUNDING_WEIGHT = 1.0
 _PROFILE_WIDTH_WEIGHT = 0.0
+# With a profile that measured the voice's hums: below this probability that a
+# hop is a hum rather than one of the voice's vowels, it cannot latch NASAL
+# (the tail of a dark /u/ reads as a murmur to the fixed thresholds). Above it,
+# the detector decides as without a profile; text, when it votes, wins.
+_PROFILE_NASAL_VETO = 0.1
+# At or above this probability of the voice's hum, a voiced hop counts as nasal
+# even if the fixed thresholds miss them (deep voices' hums). Seven Cartesia
+# voices, veto 0.1: nasal checks 101 (support off) -> 103 (0.9) -> 104 (0.8) ->
+# 105/112 (0.7, 0.6); at 0.6 nasal time on vowels creeps back up.
+_PROFILE_NASAL_SUPPORT = 0.7
 
 
 def _clamp01(value: float) -> float:
@@ -757,6 +767,7 @@ class FormantLipsyncAnalyzer(BaseLipsyncAnalyzer):
         f2_lo, f2_hi = self._effective_range(self._f2_p5, self._f2_p95, self._f2_prior)
 
         # Continuous parameter targets.
+        profile_nasal = None
         if voiced and f1 > 0.0:
             openness = _clamp01((f1 - f1_lo) / (f1_hi - f1_lo + dsp.EPSILON))
             width = _clamp01((f2 - f2_lo) / (f2_hi - f2_lo + dsp.EPSILON))
@@ -779,6 +790,10 @@ class FormantLipsyncAnalyzer(BaseLipsyncAnalyzer):
                 )
                 width = _lerp(width, profile_width, _PROFILE_WIDTH_WEIGHT)
                 rounding = _lerp(rounding, profile_rounding, _PROFILE_ROUNDING_WEIGHT)
+                if profile.has_nasal:
+                    profile_nasal = profile.nasal(
+                        formants.f1, formants.f2 if f2_found else 0.0, formants.f3
+                    )
             if vowel_f2:
                 openness = max(openness, _ROUNDED_VOWEL_MIN_OPENNESS)
         else:
@@ -803,6 +818,11 @@ class FormantLipsyncAnalyzer(BaseLipsyncAnalyzer):
             nasal_hint, phone = self._text_events.hint(
                 offset, voiced=voiced, f1=f1, rms=rms, silence_gate=silence_gate
             )
+        if nasal_hint is None and profile_nasal is not None:
+            if profile_nasal < _PROFILE_NASAL_VETO:
+                nasal_hint = False  # one of this voice's vowels, not its hum
+            elif profile_nasal >= _PROFILE_NASAL_SUPPORT:
+                nasal_hint = True  # this voice's hum
         event_fired = self._update_events(
             offset,
             rms,

@@ -45,6 +45,9 @@ VOWEL_TARGETS: dict[str, tuple[float, float]] = {
     "UW": (0.15, 0.85),
 }
 ROUNDED_VOWELS = frozenset(("OW", "UH", "UW"))
+# Label of a hum ("hmm"): the voice's nasal murmur. It shapes no vowel; the
+# profile uses it to tell its vowels from its hums (see ``nasal``).
+NASAL = "M"
 
 # F2 assumed for an exemplar whose F2 was never found: above the F2 band.
 _F2_ABOVE_BAND_HZ = 2900.0
@@ -61,7 +64,7 @@ class VowelExemplar:
 
     Parameters:
         word: The calibration word.
-        vowel: Its vowel (ARPAbet, a key of ``VOWEL_TARGETS``).
+        vowel: Its vowel (ARPAbet, a key of ``VOWEL_TARGETS``), or ``NASAL`` for a hum.
         f1: Median F1 in Hz.
         f2: Median F2 in Hz over hops where F2 was found; ``_F2_ABOVE_BAND_HZ``
             if it never was.
@@ -103,7 +106,10 @@ class VoiceProfile:
         self._sd3 = float(np.sqrt(self.covariance[2, 2]))
         self._log_found = np.log([1.0 - e.f2_missing for e in exemplars])
         self._log_missing = np.log([e.f2_missing for e in exemplars])
-        self._targets = np.array([VOWEL_TARGETS[e.vowel] for e in exemplars])
+        self._nasal = np.array([e.vowel == NASAL for e in exemplars])
+        if self._nasal.all():
+            raise ValueError("a voice profile needs at least one vowel exemplar")
+        self._targets = np.array([VOWEL_TARGETS.get(e.vowel, (0.0, 0.0)) for e in exemplars])
         self._rounded = np.array([e.vowel in ROUNDED_VOWELS for e in exemplars])
 
     @classmethod
@@ -111,7 +117,7 @@ class VoiceProfile:
         """Build a profile from calibration hops (see :mod:`lipsync.calibration`)."""
         by_word: dict[str, list[FormantSample]] = {}
         for s in samples:
-            if s.f1 > 0.0 and s.vowel in VOWEL_TARGETS:
+            if s.f1 > 0.0 and (s.vowel in VOWEL_TARGETS or s.vowel == NASAL):
                 by_word.setdefault(s.word, []).append(s)
         exemplars, residuals, f3s = [], [], []
         for word, hops in by_word.items():
@@ -165,10 +171,21 @@ class VoiceProfile:
         return p / p.sum()
 
     def articulation(self, f1: float, f2: float, f3: float) -> tuple[float, float, float]:
-        """(width, rounding, probability the vowel is rounded) for one hop."""
+        """(width, rounding, probability the vowel is rounded) for one hop, over vowels only."""
         p = self.posterior(f1, f2, f3)
-        width, rounding = p @ self._targets
-        return float(width), float(rounding), float(p[self._rounded].sum())
+        vowels = p * ~self._nasal
+        vowels /= vowels.sum()
+        width, rounding = vowels @ self._targets
+        return float(width), float(rounding), float(vowels[self._rounded].sum())
+
+    @property
+    def has_nasal(self) -> bool:
+        """Whether calibration measured this voice's hums."""
+        return bool(self._nasal.any())
+
+    def nasal(self, f1: float, f2: float, f3: float) -> float:
+        """Probability one hop is this voice's hum rather than one of its vowels."""
+        return float(self.posterior(f1, f2, f3)[self._nasal].sum())
 
     def to_dict(self) -> dict:
         return {
