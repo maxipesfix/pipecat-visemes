@@ -25,6 +25,7 @@ from lipsync.base_lipsync_analyzer import (
 from lipsync.pronunciation import load_lexicon
 from lipsync.text_events import TextEvents
 from lipsync.types import LipsyncEvent, LipsyncEventKind, LipsyncKeyframe
+from lipsync.voice_profile import VoiceProfile
 
 # Analysis hop duration in seconds (20 ms).
 HOP_SECONDS = dsp.HOP_SIZE / dsp.ANALYSIS_SAMPLE_RATE
@@ -227,6 +228,12 @@ _SNR_FULL_DB = 20.0
 _C_FIT_LOG10_FULL = 3.2
 
 
+# With a voice profile, how far rounding and width move from the F2 mapping to
+# the profile's (1 = all the way). Openness always stays on the F1 mapping.
+_PROFILE_ROUNDING_WEIGHT = 1.0
+_PROFILE_WIDTH_WEIGHT = 0.0
+
+
 def _clamp01(value: float) -> float:
     return 0.0 if value < 0.0 else (1.0 if value > 1.0 else value)
 
@@ -367,6 +374,7 @@ class FormantLipsyncAnalyzer(BaseLipsyncAnalyzer):
         heartbeat_ms: int = 240,
         collect_debug: bool = False,
         text_events_enabled: bool = False,
+        voice_profile: VoiceProfile | None = None,
     ):
         """Initialize the analyzer.
 
@@ -380,12 +388,17 @@ class FormantLipsyncAnalyzer(BaseLipsyncAnalyzer):
                 per hop in :attr:`debug_features` (dev/benchmark use only).
             text_events_enabled: Experimental English categorical priors.
                 Missing/untrusted text retains the DSP path; off by default.
+            voice_profile: Where this voice puts its vowels (see
+                :mod:`lipsync.calibration`). Width and rounding then come
+                from the profile on hops with a measured F1; without one the
+                output is unchanged.
         """
         self._dead_band = dead_band
         self._heartbeat_sec = heartbeat_ms / 1000.0
         self._collect_debug = collect_debug
         self.debug_features: list[LipsyncDebugFrame] = []
         self._text_events = TextEvents() if text_events_enabled else None
+        self._voice_profile = voice_profile
 
         # Three framings share each hop center: the 25 ms frame (energy,
         # events, nasal spectral features), the LPC frame (formants, residual
@@ -445,6 +458,10 @@ class FormantLipsyncAnalyzer(BaseLipsyncAnalyzer):
             self._text_events = TextEvents()
         elif not enabled:
             self._text_events = None
+
+    def set_voice_profile(self, profile: VoiceProfile | None):
+        """Use ``profile`` for width and rounding from the next hop on (None: the F2 mapping)."""
+        self._voice_profile = profile
 
     async def analyze(self, pcm: np.ndarray, context: LipsyncAnalysisContext) -> LipsyncFrameResult:
         """Analyze a chunk of PCM audio from one TTS context.
@@ -734,6 +751,14 @@ class FormantLipsyncAnalyzer(BaseLipsyncAnalyzer):
             rounding = _clamp01((f2_mid - f2) / (f2_mid - f2_lo + dsp.EPSILON)) * (
                 1.0 - _smoothstep(openness, *_ROUNDING_OPEN_GATE)
             )
+            if self._voice_profile is not None and f1_found:
+                # The profile scores the raw measurements: a missing F2 is
+                # itself evidence (above the band, this voice's /i/).
+                profile_width, profile_rounding, _ = self._voice_profile.articulation(
+                    formants.f1, formants.f2 if f2_found else 0.0, formants.f3
+                )
+                width = _lerp(width, profile_width, _PROFILE_WIDTH_WEIGHT)
+                rounding = _lerp(rounding, profile_rounding, _PROFILE_ROUNDING_WEIGHT)
             if vowel_f2:
                 openness = max(openness, _ROUNDED_VOWEL_MIN_OPENNESS)
         else:

@@ -45,6 +45,7 @@ from lipsync.base_lipsync_analyzer import LipsyncAnalysisContext
 from lipsync.formant_lipsync_analyzer import FormantLipsyncAnalyzer
 from lipsync.text_prior import TextAnchor, TextPrior
 from lipsync.types import LipsyncEventKind
+from lipsync.voice_profile import VoiceProfile
 
 BASELINE_PATH = RESULTS_DIR / "baseline.json"
 
@@ -158,8 +159,11 @@ async def analyze_clip(
     text_prior: bool = False,
     text_events: bool = False,
     text_stats: dict | None = None,
+    voice_profile: VoiceProfile | None = None,
 ):
-    analyzer = FormantLipsyncAnalyzer(collect_debug=True, text_events_enabled=text_events)
+    analyzer = FormantLipsyncAnalyzer(
+        collect_debug=True, text_events_enabled=text_events, voice_profile=voice_profile
+    )
     await analyzer.start(clip.sample_rate)
 
     if warm_pcm:
@@ -701,6 +705,13 @@ async def run(args) -> dict:
         raise SystemExit(f"no voices configured for provider {args.provider}")
     if args.ceiling:
         voices = [Voice(v.provider, v.id, args.ceiling) for v in voices]
+    profiles: dict[str, VoiceProfile] = {}
+    if args.voice_profiles:
+        for v in voices:
+            path = args.voice_profiles / f"{v.id}.json"
+            if path.exists():
+                profiles[v.id] = VoiceProfile.load(path)
+        print(f"voice profiles: {len(profiles)}/{len(voices)} voices ({args.voice_profiles})")
 
     results: list[ClipResult] = []
     vowels_by_voice: dict[str, VowelHops] = {}
@@ -734,6 +745,7 @@ async def run(args) -> dict:
                     text_prior=args.text_prior,
                     text_events=args.text_events,
                     text_stats=text_stats,
+                    voice_profile=profiles.get(voice.id),
                 )
                 if not debug:
                     print(f"  ! no analysis frames for {clip.label}; skipping")
@@ -790,6 +802,7 @@ async def run(args) -> dict:
             if args.text_events
             else ("untimed-corpus" if args.text_prior else "none"),
             "fixtures": str(args.fixtures) if args.fixtures else "default",
+            "voice_profiles": str(args.voice_profiles) if args.voice_profiles else None,
         },
         "composite": composite,
         "component_scores": comp_scores,
@@ -933,14 +946,23 @@ def main():
     )
     parser.add_argument("--tag", help="results file name suffix (accuracy-<tag>.json)")
     parser.add_argument(
+        "--voice-profiles",
+        type=Path,
+        help="directory of per-voice profiles (<voice_id>.json, from benchmarks.calibrate); "
+        "voices without one run uncalibrated",
+    )
+    parser.add_argument(
         "--calibrate-expectations",
         action="store_true",
         help="print Praat-oracle p90 stats per clip (for setting corpus bars) and exit",
     )
     args = parser.parse_args()
-    if args.save_baseline and (args.text_prior or args.text_events or args.negative_controls):
+    if args.save_baseline and (
+        args.text_prior or args.text_events or args.negative_controls or args.voice_profiles
+    ):
         parser.error(
-            "use --tag for text experiments; --save-baseline is reserved for DSP-only runs"
+            "use --tag for text and calibration experiments; "
+            "--save-baseline is reserved for DSP-only runs"
         )
 
     logger.remove()
