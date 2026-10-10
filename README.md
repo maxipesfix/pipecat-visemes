@@ -5,6 +5,30 @@ bots: the server analyzes streamed TTS audio and sends playout-timed
 articulation keyframes to the client, which renders an animated mouth — no
 audio analysis in the browser, no provider timestamp APIs.
 
+## About this fork
+
+This is [jptaylor/pipecat-visemes](https://github.com/jptaylor/pipecat-visemes)
+(`9c85db4`) plus work driven by a VRM avatar
+([OpenHRIai/vrm-lipsync](https://github.com/OpenHRIai/vrm-lipsync), whose bot
+example installs this fork). Asked to say "ee, ah, oo, oh, eh", the bot said
+them but the mouth didn't match. The fork:
+
+- **turns the text-informed tier on in `bot.py`** and makes it work live: word
+  times anchored on speech onset, multi-sentence (streamed) turns supported,
+  and keyframes still waiting in the delivery queue revised when word timings
+  arrive, so "oo/oh" words get rounded lips at no extra latency;
+- **stops close vowels reading as nasal murmurs** where trusted text covers
+  them ("ee" latched shut 19% → 1% of hops on the bot voice);
+- **keeps a word's timing when a long pause follows it** ("two," before a
+  comma pause no longer loses its rounding);
+- **adds a vowel-identity metric** to the accuracy benchmark (does rendered
+  rounding separate /u o/ from /i e/?).
+
+With the text tier off, analyzer output is identical to upstream. What each
+change measured, the rejected experiments and what is still open:
+[plans/vowel-rounding-results.md](plans/vowel-rounding-results.md). Nothing
+here has been offered upstream yet.
+
 Goals:
 
 - **Provider-agnostic** — works with any `TTSService`; analysis runs on the PCM
@@ -128,11 +152,11 @@ checkout once the fixtures exist; fixtures themselves are not committed. While t
 `--set dsp.LPC_ORDER=14` overrides any `dsp`/`analyzer` constant for one run and `--tag`
 names the results file; `plans/experiments/ab_table.py` runs whole A/B ladders.
 
-Text-informed work is isolated on `codex/text-informed-events`; `main` at `8ea78f0`
-is the original comparison point. Stage 1 now has an **opt-in** English pronunciation
-prior for closure/nasal decisions and timed mouth-shape hints. Default DSP behavior is
-unchanged. Enable it with `LipsyncParams(text_events_enabled=True)` or benchmark with
-`--text-events`; `--text-prior` remains observation-only. Copy the entire `lipsync/`
+The text-informed tier is an **opt-in** English pronunciation prior for closure/nasal
+decisions and timed mouth-shape hints; `LipsyncParams` leaves it off, so default DSP
+behavior is unchanged, but this fork's `bot.py` enables it
+(`LipsyncParams(text_events_enabled=True)`). Benchmark it with `--text-events`; every
+run also reports vowel identity. `--text-prior` remains observation-only. Copy the entire `lipsync/`
 directory, including its licensed, packed `data/` lexicon; no new runtime dependency.
 Results include full-precision output and PCM hashes. Use `--tag` and
 `--compare <results.json>` for paired runs, and `--fixtures <directory>` to retain a
