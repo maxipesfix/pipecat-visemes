@@ -25,7 +25,7 @@ from lipsync.base_lipsync_analyzer import (
 from lipsync.pronunciation import load_lexicon
 from lipsync.text_events import TextEvents
 from lipsync.types import LipsyncEvent, LipsyncEventKind, LipsyncKeyframe
-from lipsync.voice_profile import VoiceProfile
+from lipsync.voice_profile import ProfileLearner, VoiceProfile
 
 # Analysis hop duration in seconds (20 ms).
 HOP_SECONDS = dsp.HOP_SIZE / dsp.ANALYSIS_SAMPLE_RATE
@@ -375,6 +375,7 @@ class FormantLipsyncAnalyzer(BaseLipsyncAnalyzer):
         collect_debug: bool = False,
         text_events_enabled: bool = False,
         voice_profile: VoiceProfile | None = None,
+        profile_learner: ProfileLearner | None = None,
     ):
         """Initialize the analyzer.
 
@@ -392,6 +393,11 @@ class FormantLipsyncAnalyzer(BaseLipsyncAnalyzer):
                 :mod:`lipsync.calibration`). Width and rounding then come
                 from the profile on hops with a measured F1; without one the
                 output is unchanged.
+            profile_learner: Learns the voice's vowels from its own timed
+                words as it speaks (needs word timestamps in the context's
+                text prior), starting from its base profile if it has one.
+                Takes precedence over ``voice_profile``. Share one learner
+                across the analyzers of one voice.
         """
         self._dead_band = dead_band
         self._heartbeat_sec = heartbeat_ms / 1000.0
@@ -399,6 +405,7 @@ class FormantLipsyncAnalyzer(BaseLipsyncAnalyzer):
         self.debug_features: list[LipsyncDebugFrame] = []
         self._text_events = TextEvents() if text_events_enabled else None
         self._voice_profile = voice_profile
+        self._profile_learner = profile_learner
 
         # Three framings share each hop center: the 25 ms frame (energy,
         # events, nasal spectral features), the LPC frame (formants, residual
@@ -485,6 +492,8 @@ class FormantLipsyncAnalyzer(BaseLipsyncAnalyzer):
             remaining = remaining[take:]
             self._drain(result)
         result.processed_up_to = self._hops * HOP_SECONDS
+        if self._profile_learner is not None:
+            self._profile_learner.update(context.text_prior, result.processed_up_to)
         return result
 
     async def flush(self, context: LipsyncAnalysisContext) -> LipsyncFrameResult:
@@ -509,6 +518,8 @@ class FormantLipsyncAnalyzer(BaseLipsyncAnalyzer):
             self._buf[self._buf_len : self._buf_len + self._pad] = 0.0
             self._buf_len += self._pad
         self._drain(result)
+        if self._profile_learner is not None:
+            self._profile_learner.update(context.text_prior, self._hops * HOP_SECONDS + 1.0)
         self._flush_conditioning(result)
         self._emit_rest_keyframe(result)
         # Everything ingested is final: tail discarded, pending closures dead.
@@ -549,6 +560,8 @@ class FormantLipsyncAnalyzer(BaseLipsyncAnalyzer):
     def _reset_utterance_state(self):
         if self._text_events is not None:
             self._text_events.reset()
+        if getattr(self, "_profile_learner", None) is not None:
+            self._profile_learner.begin_utterance()
         # The buffer leads with the widest frame's left context (zeros at the
         # utterance start), so buffer index 0 is that frame's first start.
         self._buf[: self._pad] = 0.0
@@ -751,10 +764,17 @@ class FormantLipsyncAnalyzer(BaseLipsyncAnalyzer):
             rounding = _clamp01((f2_mid - f2) / (f2_mid - f2_lo + dsp.EPSILON)) * (
                 1.0 - _smoothstep(openness, *_ROUNDING_OPEN_GATE)
             )
-            if self._voice_profile is not None and f1_found:
+            profile = self._voice_profile
+            if self._profile_learner is not None:
+                profile = self._profile_learner.profile
+                if f1_found:
+                    self._profile_learner.observe(
+                        offset, formants.f1, formants.f2 if f2_found else 0.0, formants.f3, rms
+                    )
+            if profile is not None and f1_found:
                 # The profile scores the raw measurements: a missing F2 is
                 # itself evidence (above the band, this voice's /i/).
-                profile_width, profile_rounding, _ = self._voice_profile.articulation(
+                profile_width, profile_rounding, _ = profile.articulation(
                     formants.f1, formants.f2 if f2_found else 0.0, formants.f3
                 )
                 width = _lerp(width, profile_width, _PROFILE_WIDTH_WEIGHT)

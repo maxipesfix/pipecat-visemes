@@ -194,3 +194,138 @@ class VoiceProfile:
     @classmethod
     def load(cls, path: str | Path) -> "VoiceProfile":
         return cls.from_dict(json.loads(Path(path).read_text()))
+
+
+# Online learning: word timestamps (TTS word clock) run early against the audio
+# by about this much on Cartesia, enough to put a word's window on the
+# previous word's vowel.
+_ONLINE_WORD_SHIFT_SEC = 0.1
+# A word is taken once the analysis is this far past its end (the hops there
+# are final).
+_ONLINE_SETTLE_SEC = 0.1
+# Most recent hops kept per learned word, and the minimum audio between refits.
+_ONLINE_MAX_HOPS_PER_WORD = 60
+_ONLINE_REFIT_SEC = 1.0
+# A profile learned without calibration is used only once it has this many
+# words, with both rounded and unrounded vowels among them.
+_ONLINE_MIN_WORDS = 6
+# Hops kept for the current utterance (about 8 s at 20 ms).
+_ONLINE_MAX_HOPS = 400
+
+
+def _single_vowel(word: str) -> str | None:
+    """The vowel of a single-vowel dictionary word with a profile target, else None."""
+    from lipsync.pronunciation import pronounce, tokenize
+
+    tokens = tokenize(word)
+    if len(tokens) != 1 or tokens[0] in _REDUCIBLE:
+        return None
+    pron = pronounce(tokens[0])
+    if not pron.certain:
+        return None
+    vowels = [p for p in pron.phones if p in VOWEL_TARGETS or p in _OTHER_VOWELS]
+    return vowels[0] if len(vowels) == 1 and vowels[0] in VOWEL_TARGETS else None
+
+
+_OTHER_VOWELS = frozenset(("AO", "AW", "AY", "ER", "OY"))
+# Function words usually spoken reduced (to -> "tuh"): their dictionary vowel
+# is not what is in the audio, so they would teach the profile that schwa is
+# rounded, or spread.
+_REDUCIBLE = frozenset(
+    "a an the to of and or for from at as in on by is it its be been was were are am "
+    "you your do does did would could should can will just than then that this them "
+    "he she we me my us our her his him has have had but so if not".split()
+)
+
+
+class ProfileLearner:
+    """Refines a voice profile from the bot's own words as it speaks.
+
+    The TTS's word timestamps label the audio: each finished single-vowel
+    dictionary word ("you", "two", "see") adds its loud voiced hops under that
+    word, and the profile is refit from them. Calibration exemplars stay as
+    measured (their labels are cleaner); learned words are added beside them.
+    Without a calibration profile, the learned one is used once it covers
+    enough words. One learner per voice session, carried across utterances.
+    """
+
+    def __init__(self, base: VoiceProfile | None = None):
+        self.base = base
+        self.profile = base
+        self.words_learned = 0
+        self._samples: dict[str, list[FormantSample]] = {}
+        self._hops: list[tuple[float, float, float, float, float]] = []
+        self._taken = 0
+        self._last_refit: float | None = None
+        self._audio_seen = 0.0
+        self._utterance_start = 0.0
+
+    def begin_utterance(self):
+        """A new TTS context: offsets restart at zero."""
+        self._audio_seen += self._utterance_start
+        self._utterance_start = 0.0
+        self._hops.clear()
+        self._taken = 0
+
+    def observe(self, offset: float, f1: float, f2: float, f3: float, rms: float):
+        """One voiced hop with a measured F1 (raw formants, 0.0 = not found)."""
+        self._hops.append((offset, f1, f2, f3, rms))
+        if len(self._hops) > _ONLINE_MAX_HOPS:
+            del self._hops[: len(self._hops) - _ONLINE_MAX_HOPS]
+        self._utterance_start = max(self._utterance_start, offset)
+
+    def update(self, prior, cursor: float):
+        """Take the words whose audio has been analyzed; refit if due."""
+        if prior is None or prior.word_start_pts is None:
+            return
+        times = [(w.text, (w.pts - prior.word_start_pts) / 1e9) for w in prior.words]
+        added = False
+        for i in range(self._taken, len(times)):
+            end = times[i + 1][1] if i + 1 < len(times) else prior.audio_end
+            if end is None or end + _ONLINE_WORD_SHIFT_SEC + _ONLINE_SETTLE_SEC > cursor:
+                break
+            self._taken = i + 1
+            text, start = times[i]
+            vowel = _single_vowel(text)
+            if vowel is None:
+                continue
+            lo, hi = start + _ONLINE_WORD_SHIFT_SEC, end + _ONLINE_WORD_SHIFT_SEC
+            inside = [h for h in self._hops if lo <= h[0] < hi]
+            if not inside:
+                continue
+            peak = max(h[4] for h in inside)
+            word = text.strip(".,!?;:\"'").lower()
+            kept = self._samples.setdefault(word, [])
+            kept += [
+                FormantSample(word, vowel, h[1], h[2], h[3]) for h in inside if h[4] >= 0.5 * peak
+            ]
+            del kept[: max(0, len(kept) - _ONLINE_MAX_HOPS_PER_WORD)]
+            self.words_learned += 1
+            added = True
+        now = self._audio_seen + cursor
+        if added and (self._last_refit is None or now - self._last_refit >= _ONLINE_REFIT_SEC):
+            self._last_refit = now
+            self._refit()
+
+    def _refit(self):
+        samples = [s for kept in self._samples.values() for s in kept]
+        try:
+            learned = VoiceProfile.fit(samples)
+        except ValueError:
+            return
+        if self.base is None:
+            vowels = {e.vowel for e in learned.exemplars}
+            if (
+                len(learned.exemplars) < _ONLINE_MIN_WORDS
+                or not vowels & ROUNDED_VOWELS
+                or not vowels - ROUNDED_VOWELS
+            ):
+                return
+            self.profile = learned
+            return
+        known = {e.word for e in self.base.exemplars}
+        self.profile = VoiceProfile(
+            self.base.exemplars + [e for e in learned.exemplars if e.word not in known],
+            self.base.covariance,
+            self.base.f3_fill,
+        )

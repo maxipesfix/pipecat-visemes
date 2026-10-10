@@ -128,6 +128,12 @@ checkout once the fixtures exist; fixtures themselves are not committed. While t
 `--set dsp.LPC_ORDER=14` overrides any `dsp`/`analyzer` constant for one run and `--tag`
 names the results file; `plans/experiments/ab_table.py` runs whole A/B ladders.
 
+Voices that front /u/ ("two", "new") render it spread under the F2 mapping. An opt-in per-voice
+profile fixes most of that: `uv run python -m benchmarks.calibrate` has each voice read a
+36-word list once and writes its profile; `--voice-profiles benchmarks/results/profiles/cartesia`
+scores with it, and `LipsyncParams(voice_profile_path=...)` uses it in a bot. See
+[plans/voice-calibration-results.md](plans/voice-calibration-results.md).
+
 Text-informed work is isolated on `codex/text-informed-events`; `main` at `8ea78f0`
 is the original comparison point. Stage 1 now has an **opt-in** English pronunciation
 prior for closure/nasal decisions and timed mouth-shape hints. Default DSP behavior is

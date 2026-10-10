@@ -45,7 +45,7 @@ from lipsync.base_lipsync_analyzer import LipsyncAnalysisContext
 from lipsync.formant_lipsync_analyzer import FormantLipsyncAnalyzer
 from lipsync.text_prior import TextAnchor, TextPrior
 from lipsync.types import LipsyncEventKind
-from lipsync.voice_profile import VoiceProfile
+from lipsync.voice_profile import ProfileLearner, VoiceProfile
 
 BASELINE_PATH = RESULTS_DIR / "baseline.json"
 
@@ -160,9 +160,13 @@ async def analyze_clip(
     text_events: bool = False,
     text_stats: dict | None = None,
     voice_profile: VoiceProfile | None = None,
+    profile_learner: ProfileLearner | None = None,
 ):
     analyzer = FormantLipsyncAnalyzer(
-        collect_debug=True, text_events_enabled=text_events, voice_profile=voice_profile
+        collect_debug=True,
+        text_events_enabled=text_events,
+        voice_profile=voice_profile,
+        profile_learner=profile_learner,
     )
     await analyzer.start(clip.sample_rate)
 
@@ -180,7 +184,8 @@ async def analyze_clip(
         # alignment. Do not fabricate word timing from the clip's duration.
         context.text_prior = TextPrior(anchors=(TextAnchor(clip.sentence.text),))
     keyframes, events = [], []
-    inputs = FixtureTextInputs(clip, context) if text_events else None
+    # The learner reads word timings too, without the text tier's own effects.
+    inputs = FixtureTextInputs(clip, context) if text_events or profile_learner else None
     async for chunk in chunks_16k_float32(
         clip.pcm, clip.sample_rate, on_ingest=inputs.ingest if inputs else None
     ):
@@ -712,6 +717,10 @@ async def run(args) -> dict:
             if path.exists():
                 profiles[v.id] = VoiceProfile.load(path)
         print(f"voice profiles: {len(profiles)}/{len(voices)} voices ({args.voice_profiles})")
+    # One learner per voice, carried across its clips like one session.
+    learners = (
+        {v.id: ProfileLearner(profiles.get(v.id)) for v in voices} if args.online_profiles else {}
+    )
 
     results: list[ClipResult] = []
     vowels_by_voice: dict[str, VowelHops] = {}
@@ -746,6 +755,7 @@ async def run(args) -> dict:
                     text_events=args.text_events,
                     text_stats=text_stats,
                     voice_profile=profiles.get(voice.id),
+                    profile_learner=learners.get(voice.id),
                 )
                 if not debug:
                     print(f"  ! no analysis frames for {clip.label}; skipping")
@@ -803,6 +813,7 @@ async def run(args) -> dict:
             else ("untimed-corpus" if args.text_prior else "none"),
             "fixtures": str(args.fixtures) if args.fixtures else "default",
             "voice_profiles": str(args.voice_profiles) if args.voice_profiles else None,
+            "online_profiles": args.online_profiles,
         },
         "composite": composite,
         "component_scores": comp_scores,
@@ -952,13 +963,23 @@ def main():
         "voices without one run uncalibrated",
     )
     parser.add_argument(
+        "--online-profiles",
+        action="store_true",
+        help="learn each voice's vowels from its timed words, across its clips in corpus "
+        "order (from --voice-profiles when given)",
+    )
+    parser.add_argument(
         "--calibrate-expectations",
         action="store_true",
         help="print Praat-oracle p90 stats per clip (for setting corpus bars) and exit",
     )
     args = parser.parse_args()
     if args.save_baseline and (
-        args.text_prior or args.text_events or args.negative_controls or args.voice_profiles
+        args.text_prior
+        or args.text_events
+        or args.negative_controls
+        or args.voice_profiles
+        or args.online_profiles
     ):
         parser.error(
             "use --tag for text and calibration experiments; "

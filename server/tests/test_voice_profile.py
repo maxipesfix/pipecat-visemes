@@ -10,7 +10,8 @@ from lipsync.base_lipsync_analyzer import LipsyncAnalysisContext
 from lipsync.calibration import CALIBRATION_WORDS, calibration_text, samples_from_debug
 from lipsync.dsp import ANALYSIS_SAMPLE_RATE
 from lipsync.formant_lipsync_analyzer import FormantLipsyncAnalyzer, LipsyncDebugFrame
-from lipsync.voice_profile import FormantSample, VoiceProfile
+from lipsync.text_prior import TextPrior, TextWord
+from lipsync.voice_profile import FormantSample, ProfileLearner, VoiceProfile
 from tests.synth import synth_vowel
 
 rng = np.random.default_rng(0)
@@ -145,3 +146,72 @@ def test_a_profile_rounds_a_fronted_oo_the_f2_mapping_reads_as_spread():
     # Openness and width stay on the formant mapping.
     for name in ("openness", "width"):
         assert late(calibrated, name) == pytest.approx(late(plain, name), abs=0.02)
+
+
+def prior(words, audio_end=None):
+    """A text prior with word times in seconds from the word clock's start."""
+    return TextPrior(
+        words=tuple(TextWord(w, round(t * 1e9)) for w, t in words),
+        word_start_pts=0,
+        audio_end=audio_end,
+    )
+
+
+def speak(learner, segments):
+    """Observe hops: (start s, end s, f1, f2, f3) voiced stretches at 20 ms."""
+    for start, end, f1, f2, f3 in segments:
+        for t in np.arange(start, end, 0.02):
+            learner.observe(float(t), f1, f2, f3, 0.3)
+
+
+def test_learner_takes_finished_dictionary_words_but_not_reduced_ones():
+    learner = ProfileLearner()
+    # Word times run ~0.1 s early: "two" is timed at 0.0 but voiced 0.1-0.4.
+    speak(
+        learner,
+        [(0.1, 0.4, 380, 2000, 2500), (0.6, 0.9, 300, 0, 3050), (1.1, 1.3, 500, 1500, 2600)],
+    )
+    learner.update(prior([("two", 0.0), ("tea", 0.5), ("to", 1.0)], audio_end=1.3), cursor=2.0)
+    assert set(learner._samples) == {"two", "tea"}  # "to" is usually said "tuh"
+    assert all(s.vowel == "UW" and s.f1 == 380 for s in learner._samples["two"])
+    taken = len(learner._samples["two"])
+    # Each word is taken once.
+    learner.update(prior([("two", 0.0), ("tea", 0.5), ("to", 1.0)], audio_end=1.3), cursor=3.0)
+    assert len(learner._samples["two"]) == taken
+
+
+def test_learner_waits_for_a_word_to_be_analyzed():
+    learner = ProfileLearner()
+    speak(learner, [(0.1, 0.4, 380, 2000, 2500)])
+    learner.update(prior([("two", 0.0), ("tea", 0.5)]), cursor=0.5)
+    assert not learner._samples  # "two" ends at 0.6 (with the shift): not final yet
+
+
+def test_learner_keeps_calibrated_words_and_adds_new_ones():
+    base = VoiceProfile.fit(FRONTED)
+    learner = ProfileLearner(base)
+    speak(learner, [(0.1, 0.4, 380, 2000, 2500), (0.6, 0.9, 760, 1100, 2950)])
+    learner.update(prior([("two", 0.0), ("hod", 0.5)], audio_end=0.8), cursor=2.0)
+    words = [e.word for e in learner.profile.exemplars]
+    assert words[: len(base.exemplars)] == [e.word for e in base.exemplars]
+    assert "two" in words and words.count("hod") == 1
+
+
+def test_an_uncalibrated_learner_waits_for_enough_words():
+    learner = ProfileLearner()
+    speak(learner, [(0.1, 0.4, 380, 2000, 2500)])
+    learner.update(prior([("two", 0.0)], audio_end=0.4), cursor=2.0)
+    assert learner.profile is None  # one rounded word is not a profile
+
+
+def test_processor_loads_a_profile_and_learning_collects_text(tmp_path):
+    from lipsync.lipsync_processor import LipsyncParams, LipsyncProcessor
+
+    path = tmp_path / "voice.json"
+    VoiceProfile.fit(FRONTED).save(path)
+    plain = LipsyncProcessor()
+    assert plain._analyzer._voice_profile is None and not plain._collect_text
+    calibrated = LipsyncProcessor(params=LipsyncParams(voice_profile_path=str(path)))
+    assert len(calibrated._analyzer._voice_profile.exemplars) == 5
+    learning = LipsyncProcessor(params=LipsyncParams(voice_profile_learning=True))
+    assert learning._collect_text and learning._analyzer._profile_learner is not None

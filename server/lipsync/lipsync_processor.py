@@ -59,6 +59,7 @@ from lipsync.formant_lipsync_analyzer import HOP_SECONDS, FormantLipsyncAnalyzer
 from lipsync.frames import LipsyncUpdateSettingsFrame, TTSLipsyncFrame
 from lipsync.text_prior import TextAnchor, TextWord, _TextAccumulator
 from lipsync.types import LipsyncEvent, LipsyncEventKind, LipsyncKeyframe
+from lipsync.voice_profile import ProfileLearner, VoiceProfile
 
 # Ring buffers hold at most this much un-analyzed audio per context; beyond
 # it, the oldest audio is dropped (backpressure) rather than growing memory.
@@ -124,6 +125,16 @@ class LipsyncParams(BaseModel):
         text_events_enabled: Opt in to experimental English text-informed
             events in the default analyzer. Implies text collection. Custom
             analyzers own this setting, like dead_band. Off by default.
+        voice_profile_path: A profile of the TTS voice's vowels (JSON from
+            :mod:`lipsync.calibration`, e.g. ``python -m benchmarks.calibrate``).
+            The default analyzer then reads lip rounding from it, which keeps
+            voices that front /u/ ("two", "new") from rendering it spread.
+            None (the default) keeps the formant mapping unchanged.
+        voice_profile_learning: Experimental: learn the voice's vowels from its
+            own timed words during the session, starting from
+            ``voice_profile_path`` when given. Implies text collection. Off by
+            default; on the seven-voice corpus it helps some voices and hurts
+            others (plans/voice-calibration-results.md).
     """
 
     batch_window_ms: int = 200
@@ -135,6 +146,8 @@ class LipsyncParams(BaseModel):
     enabled: bool = True
     text_prior_enabled: bool = False
     text_events_enabled: bool = False
+    voice_profile_path: str | None = None
+    voice_profile_learning: bool = False
 
 
 class _Context:
@@ -251,10 +264,19 @@ class LipsyncProcessor(FrameProcessor):
         super().__init__(**kwargs)
         self._params = params or LipsyncParams()
         self._owns_analyzer = analyzer is None
+        profile = (
+            VoiceProfile.load(self._params.voice_profile_path)
+            if self._params.voice_profile_path
+            else None
+        )
         self._analyzer = analyzer or FormantLipsyncAnalyzer(
             dead_band=self._params.dead_band,
             heartbeat_ms=self._params.heartbeat_ms,
             text_events_enabled=self._params.text_events_enabled,
+            voice_profile=profile,
+            profile_learner=ProfileLearner(profile)
+            if self._params.voice_profile_learning
+            else None,
         )
 
         # Contexts in creation order. A TTS service may reopen a context id it
@@ -307,7 +329,11 @@ class LipsyncProcessor(FrameProcessor):
 
     @property
     def _collect_text(self) -> bool:
-        return self._params.text_prior_enabled or self._params.text_events_enabled
+        return (
+            self._params.text_prior_enabled
+            or self._params.text_events_enabled
+            or self._params.voice_profile_learning
+        )
 
     async def setup(self, setup: FrameProcessorSetup):
         """Set up the processor.
