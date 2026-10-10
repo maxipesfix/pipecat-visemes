@@ -61,6 +61,21 @@ class TestReviseKeyframes(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(outside)
         self.assertTrue(all(k.rounding == 0.0 for k in outside))
 
+    async def test_a_word_before_a_long_pause_is_still_rounded(self):
+        # "Two, three": the comma's pause stretches "two" to 0.9 s, 0.45 s a
+        # phone. Its phones are capped, not dropped, and the vowel still rounds.
+        analyzer = FormantLipsyncAnalyzer(text_events_enabled=True)
+        await analyzer.start(16_000)
+        text = prior("Two, three.", TextWord("Two,", 0), TextWord("three.", 900_000_000))
+        context = LipsyncAnalysisContext("test", 16_000, text_prior=text)
+        held = [kf(0.0, energy=0.2), kf(0.1), kf(0.2), kf(0.3), kf(0.6, energy=0.01), kf(0.95)]
+        analyzer.revise_keyframes(context, held, 0.0)
+        for k in held[1:4]:
+            self.assertGreaterEqual(k.rounding, 0.7, k.offset)
+        self.assertEqual(held[5].rounding, 0.0)
+        # The pause itself is left untimed.
+        self.assertIsNone(analyzer._text_events.span_at(0.8))
+
     async def test_released_keyframes_are_out_of_reach(self):
         held = [kf(0.25), kf(0.3), kf(0.45)]
         added = await self.revise(held, start=0.25)

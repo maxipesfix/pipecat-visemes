@@ -31,6 +31,11 @@ ONSET_MAX_SHIFT = 0.3
 # the timing arrives (vetoes): wider than the closure TOLERANCE, because
 # phones are placed uniformly within words.
 NASAL_VETO_MARGIN = 0.08
+# Plausible seconds per phone when spreading a word's phones uniformly over
+# its timed interval. Shorter means the timing is unusable; longer means a
+# pause follows the word, and its phones are capped at the maximum.
+MIN_PHONE_STEP = 0.015
+MAX_PHONE_STEP = 0.35
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,9 +232,13 @@ class TextEvents:
                 group = [pronounce(word).phones for word, _ in points[i:end]]
                 count = sum(map(len, group))
                 duration = end_time - start_time
-                if count and 0.015 <= duration / count <= 0.35:
+                if count and duration / count >= MIN_PHONE_STEP:
+                    # A word runs to the next word's start, so a pause after
+                    # it ("two, three") stretches its interval: cap its
+                    # phones and leave the pause untimed rather than dropping
+                    # the word.
                     cursor = start_time
-                    step = duration / count
+                    step = min(duration / count, MAX_PHONE_STEP)
                     for word_index, phones in enumerate(group, i):
                         word_end = cursor + len(phones) * step
                         word_start = cursor
