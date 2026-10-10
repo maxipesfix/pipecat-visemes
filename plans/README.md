@@ -245,6 +245,7 @@ the issue is not precision, it is that the categorical detectors do not survive 
 | File | Status | Use it for |
 |---|---|---|
 | `README.md` (this file) | plan of record | status, findings, open / parked / not planned |
+| [vowel-rounding-results.md](vowel-rounding-results.md) | fork branch `fix/vowel-rounding` (2026-10-09) | the text tier live: vowel-identity metric, nasal fix, onset anchoring, held-keyframe revision, streamed turns, the comma-pause fix |
 | [text-informed-events.md](text-informed-events.md) | stage 1 experimental (2026-09-19) | the text tier: evidence, stages, measurement gates, what text will not fix |
 | [technical-specification.md](technical-specification.md) | design of record, as built (delta table at the top) | the design and its rationale |
 | [benchmark-harness-accuracy.md](benchmark-harness-accuracy.md) | built (2026-07); as-built notes at the top | how the accuracy score is made and read |
