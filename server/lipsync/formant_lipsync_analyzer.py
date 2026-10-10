@@ -232,6 +232,16 @@ _C_FIT_LOG10_FULL = 3.2
 # the profile's (1 = all the way). Openness always stays on the F1 mapping.
 _PROFILE_ROUNDING_WEIGHT = 1.0
 _PROFILE_WIDTH_WEIGHT = 0.0
+# How the profile's rounding combines with the F2 mapping's: "replace" (lerp
+# by _PROFILE_ROUNDING_WEIGHT), "max_soft" (the larger of the two), or
+# "max_gated" (the F2 mapping's, raised where the profile is confident the
+# vowel is a rounded one). The max modes keep the F2 mapping's continuous
+# movement, e.g. an /o/ gliding toward /u/, which categorical targets flatten.
+# Seven Cartesia voices, rounding AUC: replace 0.77, max_soft 0.80, max_gated
+# 0.81 (baseline 0.72), with the least rounding on spread vowels (0.28).
+_PROFILE_ROUNDING_MODE = "max_gated"
+_PROFILE_ROUNDED_GATE = (0.5, 0.9)
+_PROFILE_ROUNDED_LEVEL = 0.85
 # With a profile that measured the voice's hums: below this probability that a
 # hop is a hum rather than one of the voice's vowels, it cannot latch NASAL
 # (the tail of a dark /u/ reads as a murmur to the fixed thresholds). Above it,
@@ -785,11 +795,21 @@ class FormantLipsyncAnalyzer(BaseLipsyncAnalyzer):
             if profile is not None and f1_found:
                 # The profile scores the raw measurements: a missing F2 is
                 # itself evidence (above the band, this voice's /i/).
-                profile_width, profile_rounding, _ = profile.articulation(
+                profile_width, profile_rounding, p_rounded = profile.articulation(
                     formants.f1, formants.f2 if f2_found else 0.0, formants.f3
                 )
                 width = _lerp(width, profile_width, _PROFILE_WIDTH_WEIGHT)
-                rounding = _lerp(rounding, profile_rounding, _PROFILE_ROUNDING_WEIGHT)
+                if _PROFILE_ROUNDING_MODE == "replace":
+                    rounding = _lerp(rounding, profile_rounding, _PROFILE_ROUNDING_WEIGHT)
+                elif _PROFILE_ROUNDING_MODE == "max_soft":
+                    rounding = max(rounding, profile_rounding)
+                elif _PROFILE_ROUNDING_MODE == "max_gated":
+                    rounding = max(
+                        rounding,
+                        _PROFILE_ROUNDED_LEVEL * _smoothstep(p_rounded, *_PROFILE_ROUNDED_GATE),
+                    )
+                else:
+                    raise ValueError(f"unknown _PROFILE_ROUNDING_MODE {_PROFILE_ROUNDING_MODE!r}")
                 if profile.has_nasal:
                     profile_nasal = profile.nasal(
                         formants.f1, formants.f2 if f2_found else 0.0, formants.f3

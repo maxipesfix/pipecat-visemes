@@ -34,7 +34,7 @@ and a clean held-out set ("Now say boot, please.", different words from calibrat
 |---|---|
 | `lipsync/voice_profile.py` | `VoiceProfile`: one exemplar per calibration *word* (median F1/F2/F3, how often F2 went unfound), scored with a pooled covariance; a missing F2 is evidence in itself. Rounding = posterior-weighted rounding of the exemplars' vowels (targets from `plans/experiments/l4_proto.py`). Per word, not per vowel, because one voice says /u/ in two places. |
 | `lipsync/calibration.py` | 36 words plus two hums as a list ("Heed. Tea. Bead. ... Hmm. Mmm."), every vowel, /u/ after lip-closing and tongue-front consonants. Each word is its own burst of speech, found by energy (13 of 14 recordings matched the word count exactly; word timestamps are the fallback). The analyzer's own measurements become the profile. |
-| Analyzer | `FormantLipsyncAnalyzer(voice_profile=…)`: rounding from the profile on hops with a measured F1. Width and openness stay on the formant mapping (`_PROFILE_WIDTH_WEIGHT = 0`, see below). About +10 µs per hop (151 → 161 µs). |
+| Analyzer | `FormantLipsyncAnalyzer(voice_profile=…)`: on hops with a measured F1, rounding is the F2 mapping's, raised to 0.85 where the profile is confident the vowel is a rounded one (`_PROFILE_ROUNDING_MODE = "max_gated"`). Width and openness stay on the formant mapping (`_PROFILE_WIDTH_WEIGHT = 0`, see below). About +10 µs per hop (151 → 161 µs). |
 | Nasal decision | The hums become exemplars too. Below 0.1 probability of being this voice's hum, a hop cannot latch NASAL (`_PROFILE_NASAL_VETO`); at 0.7 or above it counts as nasal even if the fixed thresholds miss it (`_PROFILE_NASAL_SUPPORT`). Text, when it votes, wins. |
 | Online learning (experimental) | `ProfileLearner`: adds the voice's own finished single-vowel dictionary words (TTS word timestamps, shifted 0.1 s) as exemplars during a session; calibration exemplars stay as measured; reducible function words ("to", "you", "the") are skipped. |
 | Processor | `LipsyncParams(voice_profile_path=…, voice_profile_learning=False)`. |
@@ -67,6 +67,24 @@ before being scored on its second take, and looks better than it is (0.80 pooled
 Composite 83.9 in all four. Calibration improves six of seven voices. Online learning helps the bot
 voice and hurts others: learned exemplars come from words whose timestamps are 0.1-0.25 s off, so it
 stays off by default.
+
+### Combining the profile's rounding with the F2 mapping's
+
+Replacing the F2 mapping's rounding with the profile's posterior-weighted targets flattens movement
+within a vowel: Jolene's "Hoe" glides from /o/ toward /u/, its F2 falling and rounding rising
+0.70 -> 0.96, which the F2 mapping renders as a mouth narrowing to a small round "oo"; replaced, it
+sat flat at 0.56-0.65 (an open "oh" to the end). The profile now only raises rounding, where it is
+confident the vowel is rounded. Seven voices, two takes, sound only:
+
+| Mode | Composite | Rounding AUC pooled | Bot voice | Jolene | Rounding on rounded / spread |
+|---|---|---|---|---|---|
+| Baseline, no profile | 84.1 | 0.72 | 0.62 | 0.81 | 0.38 / 0.14 |
+| Replace | 84.4 | 0.77 | 0.75 | 0.83 | 0.59 / 0.30 |
+| Max with the soft value | 84.4 | 0.80 | 0.77 | 0.85 | 0.70 / 0.35 |
+| **Max, gated by P(rounded)** (default) | 84.3 | **0.81** | **0.77** | **0.87** | 0.71 / **0.28** |
+
+On the vrm-lipsync vowel probe (isolated words, pass/fail per vowel) gated scores one vowel lower
+than replace on three voices and the same on four; it keeps the glides the avatar shows.
 
 ### The nasal detector
 
